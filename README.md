@@ -2,824 +2,695 @@
 bai tap nhom dsa city routing
 
 """
+"""
 =============================================================================
-CITY LOGISTICS & ROUTING SYSTEM — PART 1: BUILD REALISTIC ROAD GRAPH
+CITY LOGISTICS & ROUTING SYSTEM — PART 1 OPTIMIZED
 =============================================================================
-Địa bàn  : Quận Đống Đa, Hà Nội, Việt Nam
-Mục tiêu : Xây dựng road graph nền tảng cho shortest path, VRP,
-           shipper allocation, congestion simulation, logistics optimization
+Area    : Dong Da District, Hanoi, Vietnam
+Goal    : Build a practical routing graph for shortest path, VRP, shipper
+          allocation, congestion simulation, and logistics optimization.
 
-Libraries:
-  • OSMnx     — tải road network + GIS features từ OpenStreetMap
-  • NetworkX  — biểu diễn graph, tính toán đường đi, weight
-  • GeoPandas — xử lý dữ liệu không gian (GeoDataFrame, geometry)
-  • Matplotlib — render bản đồ GIS chất lượng cao
-  • Shapely   — geometry operations (tự động qua GeoPandas)
-
-Output:
-  • dong_da_graph.graphml        — road graph cho NetworkX algorithms
-  • dong_da_nodes.geojson        — nodes (intersections) với coordinates
-  • dong_da_edges.geojson        — edges (road segments) với attributes
-  • dong_da_gis_map.png          — bản đồ GIS high-resolution (300 DPI)
+Key improvements vs the original Part 1:
+  - Uses simplify=True for routing performance while preserving edge geometry.
+  - Filters roads that are unsuitable for motorcycle/vehicle logistics.
+  - Keeps the largest weakly connected component to reduce unreachable pairs.
+  - Separates routing graph concerns from GIS rendering/export.
+  - Normalizes OSM attributes and numeric edge weights before saving.
+  - Exports compact GeoJSON with only useful routing attributes.
 =============================================================================
 """
 
-# =============================================================================
-# 1. IMPORTS & CONFIGURATION
-# =============================================================================
+from __future__ import annotations
 
 import os
 import time
 import warnings
-warnings.filterwarnings("ignore")          # suppress minor deprecation noise
+from pathlib import Path
+from typing import Any
 
-import numpy as np
-import osmnx as ox                          # OpenStreetMap network downloader
-import networkx as nx                       # graph data structure & algorithms
-import geopandas as gpd                     # GeoDataFrame = spatial DataFrame
+import geopandas as gpd
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-import matplotlib.patheffects as pe
-from matplotlib.lines import Line2D
-from matplotlib.colors import to_rgba
-from shapely.geometry import box
+import networkx as nx
+import osmnx as ox
+import pandas as pd
 
-print("=" * 70)
-print("  CITY LOGISTICS & ROUTING — PART 1: REALISTIC ROAD GRAPH")
-print("  Dong Da District, Hanoi, Vietnam")
-print("=" * 70)
+try:
+    import folium
+except ImportError:
+    folium = None
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+)
 
 
 # =============================================================================
-# 2. OSMNX CONFIGURATION
+# CONFIGURATION
 # =============================================================================
-# OSMnx settings: tăng timeout vì Đống Đa là quận đô thị dày đặc,
-# response từ Overpass API sẽ lớn (~5–15 MB raw XML)
-
-ox.settings.log_console = True
-ox.settings.use_cache = True               # cache queries → tái sử dụng nhanh
-ox.settings.cache_folder = "./osm_cache"   # thư mục lưu cache
-ox.settings.timeout = 300                  # 5 phút cho Overpass API
-ox.settings.max_query_area_size = 50_000_000_000  # cho phép vùng lớn hơn
 
 PLACE = "Đống Đa, Hà Nội, Việt Nam"
+OUTPUT_DIR = Path("./dong_da_output")
+CACHE_DIR = Path("./osm_cache")
 
-# Output paths
-OUTPUT_DIR = "./dong_da_output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs("./osm_cache", exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(exist_ok=True)
 
-
-# =============================================================================
-# 3. DOWNLOAD ROAD NETWORK — TẠI SAO simplify=False?
-# =============================================================================
-"""
-GIẢI THÍCH: simplify=True (default) gộp các node trung gian trên đường thẳng
-thành 1 edge duy nhất → đơn giản hơn nhưng MẤT thông tin:
-  • Mất các điểm uốn (curve points) của đường cong
-  • Mất intermediate intersections nhỏ
-  • Mất geometry chi tiết của ngõ hẻm, đường cong
-
-simplify=False GIỮ NGUYÊN tất cả nodes và edges từ OSM:
-  • Mỗi node là 1 điểm GPS thực tế trên bản đồ
-  • Mỗi edge là 1 đoạn đường giữa 2 nodes liên tiếp
-  • Full geometry: đường cong thật sự là đường cong trong graph
-  → Quan trọng cho: GIS rendering, congestion modeling, distance accuracy
-
-network_type="all" bao gồm:
-  • "drive"       — đường ô tô/xe máy
-  • "bike"        — đường xe đạp
-  • "walk"        — đường đi bộ (ngõ hẻm, vỉa hè)
-  → Cho logistics: shipper đi xe máy dùng TẤT CẢ loại đường
-"""
-
-print("\n[1/6] Downloading road network from OpenStreetMap...")
-print(f"      Place: {PLACE}")
-print("      network_type=all, simplify=False, retain_all=True")
-print("      (This may take 30–90 seconds on first run...)\n")
-
-start = time.time()
-
-G = ox.graph_from_place(
-    PLACE,
-    network_type="all",          # tất cả loại đường (drive + bike + walk)
-    simplify=False,              # giữ nguyên toàn bộ geometry chi tiết
-    retain_all=True,             # giữ cả các components không kết nối
-    truncate_by_edge=True,       # cắt theo boundary (không mất edge)
-)
-
-elapsed = time.time() - start
-print(f"\n✓ Network downloaded in {elapsed:.1f}s")
-print(f"  Nodes (intersections/points): {G.number_of_nodes():,}")
-print(f"  Edges (road segments):        {G.number_of_edges():,}")
-print(f"  Is directed graph:            {G.is_directed()}")
+ox.settings.log_console = True
+ox.settings.use_cache = True
+ox.settings.cache_folder = str(CACHE_DIR)
+ox.settings.timeout = 300
 
 
-# =============================================================================
-# 4. NODE & EDGE LÀ GÌ TRONG ROAD GRAPH?
-# =============================================================================
-"""
-NODE (đỉnh):
-  • Mỗi node = 1 điểm GPS (latitude, longitude) trên bản đồ
-  • Có thể là: giao lộ, điểm uốn đường, đầu ngõ, điểm cuối
-  • Attributes: osmid, y (lat), x (lon), street_count, ref, highway
-  • Trong logistics: node = điểm giao hàng, kho, depot, intersection
-
-EDGE (cạnh):
-  • Mỗi edge = 1 đoạn đường nối 2 nodes
-  • Trong directed graph: edge có HƯỚNG (u → v)
-  • Attributes: length (m), speed (km/h), travel_time (s), highway,
-               oneway, name, geometry, lanes, maxspeed, access
-  • Trong logistics: edge = đoạn đường shipper phải đi qua
-
-DIRECTED GRAPH — TẠI SAO QUAN TRỌNG CHO LOGISTICS?
-  • Đường một chiều (oneway=True): chỉ đi được 1 hướng
-  • Khác nhau về tắc đường theo giờ: edge u→v khác v→u
-  • VRP cần biết hướng đi để tính route hợp lệ
-  • Shipper không thể đi ngược chiều → vi phạm traffic law
-  → MultiDiGraph: cho phép nhiều edges giữa cùng 2 nodes (song song)
-    (vd: 2 làn đường cùng chiều nhưng khác tốc độ/loại)
-"""
-
-# Sample node info
-sample_node = list(G.nodes(data=True))[0]
-print(f"\n  Sample Node #{sample_node[0]}:")
-for k, v in list(sample_node[1].items())[:6]:
-    print(f"    {k}: {v}")
-
-# Sample edge info
-sample_edge = list(G.edges(data=True))[0]
-print(f"\n  Sample Edge ({sample_edge[0]} → {sample_edge[1]}):")
-for k, v in list(sample_edge[2].items())[:8]:
-    print(f"    {k}: {v}")
-
-
-# =============================================================================
-# 5. ADD WEIGHTS — WEIGHTED DIRECTED GRAPH CHO LOGISTICS
-# =============================================================================
-"""
-WEIGHTED DIRECTED GRAPH:
-Mỗi edge cần được gán trọng số (weight) phản ánh "chi phí" di chuyển.
-Trong logistics, có nhiều loại weight:
-
-  1. length (m)         → minimize total distance (fuel cost)
-  2. travel_time (s)    → minimize delivery time (SLA)
-  3. congestion_weight  → penalize congested roads (realistic routing)
-  4. speed_weight       → inverse of speed (slower road = higher weight)
-
-OSMnx có built-in: add_edge_speeds() + add_edge_travel_times()
-  • add_edge_speeds(): điền maxspeed dựa trên highway type nếu thiếu
-  • add_edge_travel_times(): tính travel_time = length / speed
-"""
-
-print("\n[2/6] Adding edge weights for logistics routing...")
-
-# Thêm tốc độ dựa trên loại đường (nếu maxspeed không có trong OSM)
-# Hà Nội speed limits theo highway type:
-heuristic_speeds = {
-    "motorway": 80,
-    "trunk": 60,
-    "primary": 50,
-    "secondary": 40,
-    "tertiary": 30,
-    "residential": 25,
-    "service": 15,
-    "unclassified": 20,
+# Speeds are tuned for inner-city Hanoi motorcycle/logistics routing.
+# Unit: km/h.
+HEURISTIC_SPEEDS = {
+    "motorway": 70,
+    "trunk": 55,
+    "primary": 40,
+    "secondary": 32,
+    "tertiary": 26,
+    "residential": 22,
+    "service": 14,
+    "unclassified": 18,
     "living_street": 10,
-    "pedestrian": 5,
-    "footway": 5,
-    "path": 8,
-    "cycleway": 12,
-    "track": 15,
-    "road": 25,
+    "road": 20,
 }
 
-G = ox.add_edge_speeds(G,hwy_speeds=heuristic_speeds)
-G = ox.add_edge_travel_times(G)
+# Roads that should not be used for vehicle/motorcycle logistics.
+BLOCKED_HIGHWAYS = {
+    "footway",
+    "steps",
+    "pedestrian",
+    "cycleway",
+    "bridleway",
+    "corridor",
+    "elevator",
+    "escalator",
+    "platform",
+    "proposed",
+    "construction",
+}
 
-# Thêm custom weights cho từng use case
-for u, v, k, data in G.edges(data=True, keys=True):
+NO_ACCESS_VALUES = {"no", "private", "customers", "permit"}
 
-    length   = data.get("length", 50)            # meters
-    speed    = data.get("speed_kph", 20)         # km/h
-    travel_t = data.get("travel_time", 10)       # seconds
-    highway  = data.get("highway", "unclassified")
-    if isinstance(highway, list):
-        highway = highway[0]
-    oneway   = data.get("oneway", False)
-    lanes    = data.get("lanes", 1)
-    if isinstance(lanes, list):
-        try:
-            lanes = int(lanes[0])
-        except (ValueError, TypeError):
-            lanes = 1
-    else:
-        try:
-            lanes = int(lanes)
-        except (ValueError, TypeError):
-            lanes = 1
+EXPORT_EDGE_COLUMNS = [
+    "u",
+    "v",
+    "key",
+    "geometry",
+    "osmid",
+    "highway",
+    "name",
+    "length",
+    "oneway",
+    "lanes",
+    "maxspeed",
+    "speed_kph",
+    "travel_time",
+    "weight_distance",
+    "weight_time",
+    "weight_congestion",
+    "weight_logistics",
+    "congestion_factor",
+    "capacity",
+]
 
-    # --- Weight 1: distance weight (chuẩn hóa về km) ---
-    G[u][v][k]["weight_distance"] = length / 1000.0
+STATIC_ROAD_STYLE = {
+    "motorway": ("#e67e22", "#f39c12", 3.2, 2.0, 9, 1.0),
+    "trunk": ("#e67e22", "#f39c12", 3.0, 1.9, 9, 1.0),
+    "primary": ("#d97706", "#fbbf24", 2.6, 1.6, 8, 1.0),
+    "secondary": ("#9ca3af", "#ffffff", 2.0, 1.2, 7, 1.0),
+    "tertiary": ("#9ca3af", "#ffffff", 1.5, 0.9, 6, 0.95),
+    "residential": ("#a3a3a3", "#ffffff", 1.1, 0.7, 5, 0.9),
+    "service": ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
+    "living_street": ("#bdbdbd", "#f3f4f6", 0.8, 0.45, 4, 0.82),
+    "unclassified": ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
+    "road": ("#a3a3a3", "#ffffff", 1.0, 0.65, 5, 0.9),
+    "_default": ("#bdbdbd", "#dddddd", 0.7, 0.4, 3, 0.75),
+}
 
-    # --- Weight 2: time weight (phút) ---
-    G[u][v][k]["weight_time"] = travel_t / 60.0
+INTERACTIVE_ROAD_STYLE = {
+    "motorway": ("#e67e22", 5),
+    "trunk": ("#e67e22", 5),
+    "primary": ("#f59e0b", 4),
+    "secondary": ("#facc15", 3),
+    "tertiary": ("#2563eb", 3),
+    "residential": ("#6b7280", 2),
+    "service": ("#9ca3af", 2),
+    "living_street": ("#9ca3af", 2),
+    "unclassified": ("#9ca3af", 2),
+    "road": ("#6b7280", 2),
+}
 
-    # --- Weight 3: congestion penalty ---
-    # Mô phỏng tắc đường giờ cao điểm Hà Nội (07:00–09:00, 17:00–19:00)
-    # Primary/Secondary roads hay tắc hơn residential/service
-    congestion_factor = {
-        "motorway": 1.2,
-        "trunk": 1.4,
-        "primary": 1.8,      # Nguyễn Trãi, Láng, Tây Sơn rất tắc
-        "secondary": 1.6,
-        "tertiary": 1.3,
-        "residential": 1.1,
-        "service": 1.0,
-        "living_street": 1.0,
-        "unclassified": 1.1,
-    }.get(highway, 1.1)
 
-    G[u][v][k]["congestion_factor"] = congestion_factor
-    G[u][v][k]["weight_congestion"] = (travel_t / 60.0) * congestion_factor
+# =============================================================================
+# HELPERS
+# =============================================================================
 
-    # --- Weight 4: logistics composite weight ---
-    # Kết hợp: thời gian + phí xăng (distance) + penalty tắc
-    fuel_cost_per_km = 2000  # VND/km (ước tính xe máy)
-    time_value = 500         # VND/phút (opportunity cost)
+def first_value(value: Any, default: Any = None) -> Any:
+    """Return the first scalar value from common OSM list-like attributes."""
+    if isinstance(value, (list, tuple, set)):
+        return next(iter(value), default)
+    return value if value is not None else default
 
-    G[u][v][k]["weight_logistics"] = (
-        (travel_t / 60.0) * time_value * congestion_factor
-        + (length / 1000.0) * fuel_cost_per_km
+
+def to_float(value: Any, default: float) -> float:
+    """Convert OSM string/list values to float safely."""
+    value = first_value(value, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def to_int(value: Any, default: int) -> int:
+    """Convert OSM string/list values to int safely."""
+    value = first_value(value, default)
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_highway(value: Any) -> str:
+    """Normalize an OSM highway attribute to a single lowercase string."""
+    value = first_value(value, "unclassified")
+    return str(value).lower() if value is not None else "unclassified"
+
+
+def is_blocked_for_logistics(edge_data: dict[str, Any]) -> bool:
+    """
+    Decide whether an OSM edge is unsuitable for logistics routing.
+
+    This is conservative: it removes explicit pedestrian/cycle-only facilities
+    and edges with clear vehicle or motorcycle access restrictions.
+    """
+    highway = normalize_highway(edge_data.get("highway"))
+    if highway in BLOCKED_HIGHWAYS:
+        return True
+
+    access = str(first_value(edge_data.get("access"), "")).lower()
+    vehicle = str(first_value(edge_data.get("vehicle"), "")).lower()
+    motor_vehicle = str(first_value(edge_data.get("motor_vehicle"), "")).lower()
+    motorcycle = str(first_value(edge_data.get("motorcycle"), "")).lower()
+
+    if access in NO_ACCESS_VALUES:
+        return True
+    if vehicle == "no" or motor_vehicle == "no" or motorcycle == "no":
+        return True
+
+    return False
+
+
+def keep_largest_component(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Keep the largest weakly connected component for directed road graphs."""
+    if G.number_of_nodes() == 0:
+        return G
+    if nx.is_weakly_connected(G):
+        return G
+
+    largest = max(nx.weakly_connected_components(G), key=len)
+    return G.subgraph(largest).copy()
+
+
+def clean_object_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Make GeoJSON export robust by converting unsupported object values.
+
+    Geometry is left untouched. Lists/dicts are stringified; normal scalar values
+    are kept as-is where possible.
+    """
+    cleaned = gdf.copy()
+    for col in cleaned.columns:
+        if col == cleaned.geometry.name:
+            continue
+        if cleaned[col].dtype == object:
+            cleaned[col] = cleaned[col].map(
+                lambda x: ", ".join(map(str, x))
+                if isinstance(x, (list, tuple, set))
+                else str(x)
+                if isinstance(x, dict)
+                else x
+            )
+    return cleaned
+
+
+def display_value(value: Any, default: str = "Unnamed road") -> str:
+    """Convert OSM scalar/list values to a readable string for map labels."""
+    if value is None:
+        return default
+    if isinstance(value, float) and pd.isna(value):
+        return default
+    if isinstance(value, (list, tuple, set)):
+        values = [str(item) for item in value if item is not None and not pd.isna(item)]
+        return ", ".join(values) if values else default
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return default
+    return text
+
+
+def add_logistics_weights(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Add routing weights needed by later shortest path and VRP stages."""
+    G = ox.add_edge_speeds(G, hwy_speeds=HEURISTIC_SPEEDS)
+    G = ox.add_edge_travel_times(G)
+
+    congestion_by_highway = {
+        "motorway": 1.15,
+        "trunk": 1.30,
+        "primary": 1.75,
+        "secondary": 1.55,
+        "tertiary": 1.30,
+        "residential": 1.12,
+        "service": 1.05,
+        "living_street": 1.05,
+        "unclassified": 1.12,
+        "road": 1.15,
+    }
+
+    fuel_cost_per_km = 2000.0
+    time_value_per_min = 500.0
+
+    for _, _, _, data in G.edges(keys=True, data=True):
+        highway = normalize_highway(data.get("highway"))
+        length_m = to_float(data.get("length"), 50.0)
+        speed_kph = to_float(data.get("speed_kph"), HEURISTIC_SPEEDS.get(highway, 20))
+        travel_time_s = to_float(data.get("travel_time"), length_m / max(speed_kph, 1) * 3.6)
+        lanes = max(to_int(data.get("lanes"), 1), 1)
+
+        congestion = congestion_by_highway.get(highway, 1.12)
+        distance_km = length_m / 1000.0
+        time_min = travel_time_s / 60.0
+
+        data["highway"] = highway
+        data["length"] = length_m
+        data["speed_kph"] = speed_kph
+        data["travel_time"] = travel_time_s
+        data["lanes"] = lanes
+        data["weight_distance"] = distance_km
+        data["weight_time"] = time_min
+        data["congestion_factor"] = congestion
+        data["weight_congestion"] = time_min * congestion
+        data["weight_logistics"] = (
+            time_min * time_value_per_min * congestion
+            + distance_km * fuel_cost_per_km
+        )
+        data["capacity"] = lanes * speed_kph
+
+    return G
+
+
+def build_routing_graph() -> nx.MultiDiGraph:
+    """
+    Download and prepare a practical logistics routing graph.
+
+    simplify=True is intentional: OSMnx preserves road geometry on simplified
+    edges, but the graph has far fewer routing states than simplify=False.
+    """
+    print("\n[1/5] Downloading routing graph...")
+    print(f"      Place: {PLACE}")
+    print("      network_type=all, simplify=True, retain_all=False")
+
+    start = time.time()
+    G = ox.graph_from_place(
+        PLACE,
+        network_type="all",
+        simplify=True,
+        retain_all=False,
+        truncate_by_edge=True,
     )
 
-    # --- Road capacity (lanes × speed proxy) ---
-    G[u][v][k]["capacity"] = lanes * speed
+    raw_nodes = G.number_of_nodes()
+    raw_edges = G.number_of_edges()
 
-print(f"✓ Edge weights added")
-print(f"  Weights: weight_distance, weight_time, weight_congestion, weight_logistics")
+    blocked_edges = [
+        (u, v, k)
+        for u, v, k, data in G.edges(keys=True, data=True)
+        if is_blocked_for_logistics(data)
+    ]
+    G.remove_edges_from(blocked_edges)
+    G.remove_nodes_from(list(nx.isolates(G)))
+    G = keep_largest_component(G)
 
+    elapsed = time.time() - start
+    print(f"  Raw graph:       {raw_nodes:,} nodes | {raw_edges:,} edges")
+    print(f"  Removed edges:   {len(blocked_edges):,}")
+    print(f"  Routing graph:   {G.number_of_nodes():,} nodes | {G.number_of_edges():,} edges")
+    print(f"  Download/clean:  {elapsed:.1f}s")
 
-# =============================================================================
-# 6. CONVERT TO GEODATAFRAMES — graph_to_gdfs()
-# =============================================================================
-"""
-graph_to_gdfs(): chuyển OSMnx MultiDiGraph → 2 GeoDataFrames
-
-  nodes_gdf: GeoDataFrame với geometry = Point(lon, lat)
-    • Mỗi row = 1 intersection/point
-    • CRS: EPSG:4326 (WGS84 — lat/lon toàn cầu)
-
-  edges_gdf: GeoDataFrame với geometry = LineString([points...])
-    • Mỗi row = 1 road segment
-    • Có full geometry: đường cong = list các điểm GPS
-    • Index = (u, v, key) — directed edge identifier
-
-TẠI SAO CẦN GeoDataFrame?
-  • Spatial operations: buffer, intersection, union, sjoin
-  • Export GeoJSON: chuẩn cho web mapping (Leaflet, Mapbox)
-  • Matplotlib plotting: GeoDataFrame.plot() tự xử lý CRS + geometry
-  • Spatial queries: tìm shipper gần nhất, depot trong bán kính X km
-"""
-
-print("\n[3/6] Converting graph to GeoDataFrames...")
-
-nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
-
-print(f"✓ GeoDataFrames created")
-print(f"  nodes_gdf: {len(nodes_gdf):,} rows | CRS: {nodes_gdf.crs}")
-print(f"  edges_gdf: {len(edges_gdf):,} rows | CRS: {edges_gdf.crs}")
-print(f"  Columns in edges_gdf: {list(edges_gdf.columns[:10])}...")
+    return G
 
 
-# =============================================================================
-# 7. DOWNLOAD GIS FEATURE LAYERS — features_from_place()
-# =============================================================================
-"""
-features_from_place() tải các feature polygon/point từ OSM tags:
-  • building    → building footprints (polygons)
-  • landuse     → công viên, trường học, bệnh viện...
-  • natural     → hồ nước, sông, cây xanh
-  • leisure     → công viên, sân thể thao
-
-TẠI SAO GIS RENDERING KHÁC GRAPH VISUALIZATION?
-
-  Graph Visualization (NetworkX default):
-    • Chỉ vẽ nodes + edges như đồ thị toán học
-    • Không có không gian địa lý thực
-    • Spring layout / circular layout → không phản ánh thực tế
-    → CHỈ dùng để debug algorithm, visualize connectivity
-
-  GIS Rendering (GeoPandas + Matplotlib / QGIS style):
-    • Nodes/edges có CRS thực (EPSG:4326 hoặc projected)
-    • Vẽ theo tọa độ GPS thực → đúng vị trí địa lý
-    • Nhiều layers chồng lên nhau (buildings, parks, water, roads)
-    • Road width = thực tế (primary rộng hơn residential)
-    → DÙNG cho bản đồ hiển thị thực tế, logistics dashboard
-"""
-
-print("\n[4/6] Downloading GIS feature layers from OpenStreetMap...")
-
-def safe_download_features(place, tags, layer_name):
-    """Tải features với error handling — một số tags có thể không có data."""
+def download_feature_layer(tags: dict[str, Any], layer_name: str) -> gpd.GeoDataFrame | None:
+    """Download polygon GIS features for optional map/dashboard use."""
     try:
-        gdf = ox.features_from_place(place, tags=tags)
-        # Chỉ giữ polygon features (bỏ points/lines cho layers này)
+        gdf = ox.features_from_place(PLACE, tags=tags)
         gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
-        print(f"  ✓ {layer_name}: {len(gdf):,} features")
+        print(f"  {layer_name}: {len(gdf):,} polygons")
         return gdf
-    except Exception as e:
-        print(f"  ⚠ {layer_name}: {e} — skipping")
+    except Exception as exc:
+        print(f"  {layer_name}: skipped ({exc})")
         return None
 
-# --- Buildings ---
-buildings_gdf = safe_download_features(
-    PLACE,
-    tags={"building": True},
-    layer_name="Buildings"
-)
 
-# --- Parks & Green spaces ---
-parks_gdf = safe_download_features(
-    PLACE,
-    tags={"leisure": ["park", "garden", "recreation_ground"],
-          "landuse": ["grass", "meadow", "recreation_ground", "village_green"]},
-    layer_name="Parks/Green"
-)
+def export_outputs(G: nx.MultiDiGraph) -> None:
+    """Save GraphML, nodes GeoJSON, edges GeoJSON, and compact GIS layers."""
+    print("\n[4/5] Converting graph to GeoDataFrames...")
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
 
-# --- Water bodies (hồ, sông) ---
-water_gdf = safe_download_features(
-    PLACE,
-    tags={"natural": ["water", "wetland"],
-          "waterway": ["riverbank"],
-          "landuse": ["reservoir", "basin"]},
-    layer_name="Water"
-)
+    print(f"  Nodes GDF: {len(nodes_gdf):,} rows | CRS: {nodes_gdf.crs}")
+    print(f"  Edges GDF: {len(edges_gdf):,} rows | CRS: {edges_gdf.crs}")
 
-# --- Landuse (trường học, bệnh viện, commercial) ---
-landuse_gdf = safe_download_features(
-    PLACE,
-    tags={"landuse": ["residential", "commercial", "industrial",
-                      "retail", "education", "institutional"]},
-    layer_name="Landuse"
-)
+    print("\n[5/5] Saving outputs...")
 
-# --- Amenity areas (hospitals, universities) ---
-amenity_gdf = safe_download_features(
-    PLACE,
-    tags={"amenity": ["university", "hospital", "school", "college"]},
-    layer_name="Amenity areas"
-)
+    graphml_path = OUTPUT_DIR / "dong_da_graph.graphml"
+    ox.save_graphml(G, filepath=graphml_path)
+    print(f"  GraphML:       {graphml_path}")
 
-print("✓ GIS layers downloaded")
+    nodes_path = OUTPUT_DIR / "dong_da_nodes.geojson"
+    nodes_export = clean_object_columns(nodes_gdf)
+    nodes_export.to_file(nodes_path, driver="GeoJSON")
+    print(f"  Nodes GeoJSON: {nodes_path}")
+
+    edges_path = OUTPUT_DIR / "dong_da_edges.geojson"
+    edges_export = clean_object_columns(edges_gdf.reset_index())
+    keep_cols = [col for col in EXPORT_EDGE_COLUMNS if col in edges_export.columns]
+    edges_export = edges_export[keep_cols]
+    edges_export.to_file(edges_path, driver="GeoJSON")
+    print(f"  Edges GeoJSON: {edges_path}")
 
 
-# =============================================================================
-# 8. ROAD HIERARCHY — PHÂN CẤP ĐƯỜNG
-# =============================================================================
-"""
-ROAD HIERARCHY TRONG ĐÔ THỊ:
-
-Cấp 1 — Primary/Trunk (đường chính):
-  • Rộng 4–8 làn, phân cách giữa
-  • Ví dụ: Nguyễn Trãi, Láng, Tây Sơn, Hoàng Cầu
-  • Line width: 3.5–5.0px | Color: #F5A623 (vàng cam)
-
-Cấp 2 — Secondary (đường phụ chính):
-  • Rộng 2–4 làn
-  • Ví dụ: Đặng Tiến Đông, Thái Thịnh, Xã Đàn
-  • Line width: 2.5–3.5px | Color: #FDD835 (vàng)
-
-Cấp 3 — Tertiary (đường phụ):
-  • Rộng 1–2 làn
-  • Nhiều đường nội khu
-  • Line width: 1.8–2.5px | Color: #FFFFFF (trắng)
-
-Cấp 4 — Residential (đường dân sinh):
-  • Đường phố nhỏ trong khu dân cư
-  • Line width: 1.0–1.8px | Color: #FFFFFF
-
-Cấp 5 — Service/Living street (ngõ nhỏ):
-  • Ngõ hẻm, đường dịch vụ
-  • Line width: 0.5–1.0px | Color: #E0E0E0
-
-Cấp 6 — Footway/Path/Cycleway:
-  • Đường đi bộ, xe đạp
-  • Line width: 0.3–0.5px | Color: #AAAAAA (nét mờ)
-"""
-
-# Road styling config — giống Google Maps wireframe / QGIS style
-ROAD_STYLE = {
-    # (color_outline, color_fill, linewidth_outline, linewidth_fill, zorder, alpha)
-    "motorway":      ("#E67E22", "#F39C12", 2.8, 2.0, 9, 1.0),
-    "trunk":         ("#E67E22", "#F39C12", 2.5, 1.8, 9, 1.0),
-    "primary":       ("#E67E22", "#FBBF24", 2.2, 1.5, 8, 1.0),
-    "secondary":     ("#9CA3AF", "#FFFFFF", 1.8, 1.2, 7, 1.0),
-    "tertiary":      ("#9CA3AF", "#FFFFFF", 1.4, 0.9, 6, 0.95),
-    "residential":   ("#9CA3AF", "#FFFFFF", 1.0, 0.7, 5, 0.9),
-    "living_street": ("#BDBDBD", "#F5F5F5", 0.8, 0.5, 4, 0.85),
-    "service":       ("#BDBDBD", "#F0F0F0", 0.6, 0.4, 4, 0.8),
-    "unclassified":  ("#BDBDBD", "#EEEEEE", 0.7, 0.5, 4, 0.8),
-    "footway":       ("#C0C0C0", "#DDDDDD", 0.4, 0.3, 3, 0.6),
-    "path":          ("#C0C0C0", "#DDDDDD", 0.4, 0.3, 3, 0.6),
-    "cycleway":      ("#5BC0DE", "#87CEEB", 0.5, 0.3, 3, 0.7),
-    "pedestrian":    ("#C0C0C0", "#EEEEEE", 0.5, 0.3, 3, 0.6),
-    "steps":         ("#C0C0C0", "#DDDDDD", 0.3, 0.2, 3, 0.5),
-    "track":         ("#B0B0B0", "#D0D0D0", 0.4, 0.3, 3, 0.6),
-    "road":          ("#9CA3AF", "#FFFFFF", 1.0, 0.7, 5, 0.9),
-    "_default":      ("#AAAAAA", "#DDDDDD", 0.5, 0.3, 3, 0.7),
-}
-
-def get_road_style(highway_value):
-    """Trả về style cho road type, xử lý list values từ OSM."""
-    if isinstance(highway_value, list):
-        highway_value = highway_value[0]
-    if isinstance(highway_value, str):
-        # Xử lý "motorway_link" → "motorway"
-        for key in ROAD_STYLE:
-            if key != "_default" and highway_value.startswith(key):
-                return ROAD_STYLE[key]
-    return ROAD_STYLE["_default"]
+def load_saved_layer(name: str) -> gpd.GeoDataFrame | None:
+    """Load an optional saved GeoJSON layer if it exists."""
+    path = OUTPUT_DIR / f"dong_da_{name}.geojson"
+    if not path.exists():
+        return None
+    try:
+        return gpd.read_file(path)
+    except Exception:
+        return None
 
 
-# =============================================================================
-# 9. GIS RENDERING — PRODUCTION QUALITY MAP
-# =============================================================================
-"""
-Rendering strategy (từ dưới lên — back to front):
-  Layer 0: Background (màu đất/nền thành phố)
-  Layer 1: Landuse polygons (commercial, residential zones)
-  Layer 2: Park/green polygons (màu xanh lá)
-  Layer 3: Water polygons (màu xanh dương)
-  Layer 4: Building footprints (màu xám nhạt)
-  Layer 5: Road casings (viền ngoài — màu tối hơn, dày hơn)
-  Layer 6: Road fills (màu đường thực — trắng/vàng theo hierarchy)
-  Layer 7: Labels & Legend
-"""
+def static_road_style(highway: Any) -> tuple[str, str, float, float, int, float]:
+    highway = normalize_highway(highway)
+    return STATIC_ROAD_STYLE.get(highway, STATIC_ROAD_STYLE["_default"])
 
-print("\n[5/6] Rendering GIS map (production quality)...")
-print("      Layers: background → landuse → parks → water → buildings → roads")
 
-# --- Figure setup ---
-fig, ax = plt.subplots(1, 1, figsize=(20, 22), dpi=300,
-                        facecolor="#F0EBE3")  # Warm paper background
-ax.set_facecolor("#F0EBE3")
+def iter_latlon_paths(geometry: Any):
+    """Yield Folium-ready [(lat, lon), ...] paths from line geometries."""
+    if geometry is None or geometry.is_empty:
+        return
+    if geometry.geom_type == "LineString":
+        yield [(lat, lon) for lon, lat in geometry.coords]
+    elif geometry.geom_type == "MultiLineString":
+        for part in geometry.geoms:
+            yield [(lat, lon) for lon, lat in part.coords]
 
-# Lấy bounding box của district
-bbox = nodes_gdf.total_bounds   # [minx, miny, maxx, maxy]
-margin = 0.005
-ax.set_xlim(bbox[0] - margin, bbox[2] + margin)
-ax.set_ylim(bbox[1] - margin, bbox[3] + margin)
 
-# =============================================================================
-# LAYER 1: LANDUSE
-# =============================================================================
-if landuse_gdf is not None and len(landuse_gdf) > 0:
-    landuse_colors = {
-        "residential": "#E8E0D8",
-        "commercial":  "#F7E6C4",
-        "retail":      "#FDEBD0",
-        "industrial":  "#E0D8D0",
-        "education":   "#DFE6E0",
-        "institutional":"#DFE6E0",
-    }
-    for lu_type, color in landuse_colors.items():
-        subset = landuse_gdf[
-            landuse_gdf.get("landuse", gpd.pd.Series()).astype(str) == lu_type
-        ] if "landuse" in landuse_gdf.columns else gpd.GeoDataFrame()
-        if len(subset) > 0:
-            subset.plot(ax=ax, color=color, edgecolor="none",
-                       alpha=0.6, zorder=1)
+def save_static_map(G: nx.MultiDiGraph) -> None:
+    """Save a static, report-friendly PNG map of the optimized graph."""
+    print("\n[MAP] Rendering static PNG map...")
 
-# =============================================================================
-# LAYER 2: PARKS & GREEN SPACES
-# =============================================================================
-if parks_gdf is not None and len(parks_gdf) > 0:
-    parks_gdf.plot(ax=ax,
-                   color="#C8E6C9",        # xanh lá nhạt
-                   edgecolor="#A5D6A7",
-                   linewidth=0.3,
-                   alpha=0.85,
-                   zorder=2)
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
+    buildings = load_saved_layer("buildings")
+    parks = load_saved_layer("parks")
+    water = load_saved_layer("water")
 
-# =============================================================================
-# LAYER 3: WATER BODIES
-# =============================================================================
-if water_gdf is not None and len(water_gdf) > 0:
-    water_gdf.plot(ax=ax,
-                   color="#B3D9FF",        # xanh dương nhạt
-                   edgecolor="#90C4E8",
-                   linewidth=0.5,
-                   alpha=0.9,
-                   zorder=3)
+    fig, ax = plt.subplots(1, 1, figsize=(18, 20), dpi=220, facecolor="#f4efe7")
+    ax.set_facecolor("#f4efe7")
 
-# =============================================================================
-# LAYER 4: BUILDINGS
-# =============================================================================
-if buildings_gdf is not None and len(buildings_gdf) > 0:
-    buildings_gdf.plot(ax=ax,
-                       color="#D6CFC8",    # xám ấm
-                       edgecolor="#BDB5AD",
-                       linewidth=0.15,
-                       alpha=0.75,
-                       zorder=4)
-    print(f"  ✓ Buildings: {len(buildings_gdf):,} polygons rendered")
+    bounds = nodes_gdf.total_bounds
+    margin = 0.004
+    ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
+    ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
 
-# =============================================================================
-# LAYER 5 & 6: ROADS — Road Casing + Road Fill
-# =============================================================================
-# Group edges by highway type để render từng loại với style riêng
-highway_col = edges_gdf["highway"].apply(
-    lambda x: x[0] if isinstance(x, list) else (x if isinstance(x, str) else "unclassified")
-)
+    if parks is not None and len(parks) > 0:
+        parks.plot(
+            ax=ax,
+            color="#c8e6c9",
+            edgecolor="#a5d6a7",
+            linewidth=0.25,
+            alpha=0.85,
+            zorder=1,
+        )
 
-# Render theo thứ tự cấp độ (thấp nhất trước, cao nhất sau)
-RENDER_ORDER = [
-    "steps", "footway", "path", "cycleway", "pedestrian",
-    "track", "service", "living_street", "unclassified",
-    "residential", "tertiary", "secondary", "primary",
-    "trunk", "motorway"
-]
+    if water is not None and len(water) > 0:
+        water.plot(
+            ax=ax,
+            color="#b3d9ff",
+            edgecolor="#90c4e8",
+            linewidth=0.35,
+            alpha=0.92,
+            zorder=2,
+        )
 
-# Thêm các loại chưa có trong list
-other_types = [t for t in highway_col.unique() if t not in RENDER_ORDER]
-render_sequence = other_types + RENDER_ORDER
+    if buildings is not None and len(buildings) > 0:
+        buildings.plot(
+            ax=ax,
+            color="#d6cfc8",
+            edgecolor="#bdb5ad",
+            linewidth=0.08,
+            alpha=0.72,
+            zorder=3,
+        )
 
-road_counts = {}
-for road_type in render_sequence:
-    mask = highway_col == road_type
-    subset = edges_gdf[mask]
-    if len(subset) == 0:
-        continue
+    highway_col = edges_gdf["highway"].map(normalize_highway)
+    render_order = [
+        "service",
+        "living_street",
+        "unclassified",
+        "road",
+        "residential",
+        "tertiary",
+        "secondary",
+        "primary",
+        "trunk",
+        "motorway",
+    ]
 
-    style = get_road_style(road_type)
-    color_out, color_fill, lw_out, lw_fill, zorder, alpha = style
-    road_counts[road_type] = len(subset)
+    other_types = [t for t in highway_col.unique() if t not in render_order]
+    for road_type in other_types + render_order:
+        subset = edges_gdf[highway_col == road_type]
+        if len(subset) == 0:
+            continue
 
-    # Casing (viền ngoài — tạo hiệu ứng depth)
-    subset.plot(ax=ax,
-                color=color_out,
-                linewidth=lw_out * 1.6,
-                alpha=alpha * 0.7,
-                zorder=zorder,
-                capstyle="round",
-                joinstyle="round")
+        outline, fill, outline_width, fill_width, zorder, alpha = static_road_style(road_type)
+        subset.plot(
+            ax=ax,
+            color=outline,
+            linewidth=outline_width,
+            alpha=alpha * 0.65,
+            zorder=zorder,
+            capstyle="round",
+            joinstyle="round",
+        )
+        subset.plot(
+            ax=ax,
+            color=fill,
+            linewidth=fill_width,
+            alpha=alpha,
+            zorder=zorder + 0.1,
+            capstyle="round",
+            joinstyle="round",
+        )
 
-    # Fill (màu đường thực)
-    subset.plot(ax=ax,
-                color=color_fill,
-                linewidth=lw_fill,
-                alpha=alpha,
-                zorder=zorder + 0.5,
-                capstyle="round",
-                joinstyle="round")
-
-# In thống kê road types
-print("\n  Road type distribution:")
-for rt in sorted(road_counts, key=road_counts.get, reverse=True)[:12]:
-    bar = "█" * min(int(road_counts[rt] / 100), 40)
-    print(f"    {rt:20s}: {road_counts[rt]:5,}  {bar}")
-
-# =============================================================================
-# LAYER 7: AMENITIES (trường đại học, bệnh viện)
-# =============================================================================
-if amenity_gdf is not None and len(amenity_gdf) > 0:
-    amenity_gdf.plot(ax=ax,
-                     color="#E8F5E9",
-                     edgecolor="#66BB6A",
-                     linewidth=0.5,
-                     alpha=0.6,
-                     zorder=5)
-
-# =============================================================================
-# MAP DECORATION — Title, Legend, North Arrow, Scale
-# =============================================================================
-
-# --- Title ---
-ax.set_title(
-    "Quận Đống Đa — Road Network & Urban Features\nHà Nội, Việt Nam",
-    fontsize=16, fontweight="bold", color="#1A1A2E",
-    pad=15, loc="left",
-    fontfamily="DejaVu Sans"
-)
-ax.text(0.99, 1.01,
-        "OpenStreetMap Contributors | OSMnx + GeoPandas",
+    ax.set_title(
+        "Dong Da District - Optimized Logistics Road Graph",
+        fontsize=15,
+        fontweight="bold",
+        loc="left",
+        pad=12,
+        color="#111827",
+    )
+    ax.text(
+        1.0,
+        1.01,
+        "OpenStreetMap | OSMnx + GeoPandas",
         transform=ax.transAxes,
-        fontsize=7, color="#888888", ha="right", va="bottom")
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        color="#6b7280",
+    )
+    ax.set_axis_off()
 
-# --- Axes labels ---
-ax.set_xlabel("Longitude (°E)", fontsize=9, color="#555555", labelpad=6)
-ax.set_ylabel("Latitude (°N)", fontsize=9, color="#555555", labelpad=6)
-ax.tick_params(axis="both", which="major", labelsize=7.5, colors="#666666")
-
-# Grid
-ax.grid(True, linestyle="--", linewidth=0.3, color="#BBBBBB", alpha=0.5,
-        zorder=0)
-ax.set_axisbelow(True)
-
-# --- Legend ---
-legend_elements = [
-    mpatches.Patch(facecolor="#F39C12", edgecolor="#E67E22",
-                   label="Primary/Trunk roads"),
-    mpatches.Patch(facecolor="#FFFFFF", edgecolor="#9CA3AF",
-                   label="Secondary/Tertiary roads"),
-    mpatches.Patch(facecolor="#FFFFFF", edgecolor="#BDBDBD",
-                   label="Residential/Service/Alleys"),
-    Line2D([0], [0], color="#87CEEB", linewidth=1.5,
-           label="Cycleways"),
-    mpatches.Patch(facecolor="#C8E6C9", edgecolor="#A5D6A7",
-                   label="Parks & Green spaces"),
-    mpatches.Patch(facecolor="#B3D9FF", edgecolor="#90C4E8",
-                   label="Water bodies (hồ/sông)"),
-    mpatches.Patch(facecolor="#D6CFC8", edgecolor="#BDB5AD",
-                   label="Buildings"),
-    mpatches.Patch(facecolor="#F7E6C4", edgecolor="none",
-                   label="Commercial areas"),
-]
-
-legend = ax.legend(
-    handles=legend_elements,
-    loc="lower left",
-    fontsize=8,
-    title="Map Legend",
-    title_fontsize=9,
-    framealpha=0.92,
-    facecolor="#FAFAFA",
-    edgecolor="#CCCCCC",
-    borderpad=0.8,
-    handlelength=1.4,
-)
-legend.get_title().set_fontweight("bold")
-legend.get_title().set_color("#1A1A2E")
-
-# --- Stats box ---
-stats_text = (
-    f"Graph Statistics\n"
-    f"─────────────────\n"
-    f"Nodes: {G.number_of_nodes():,}\n"
-    f"Edges: {G.number_of_edges():,}\n"
-    f"Buildings: {len(buildings_gdf):,}\n" if buildings_gdf is not None else ""
-    f"Road types: {len(road_counts)}"
-)
-ax.text(0.995, 0.995, stats_text,
-        transform=ax.transAxes, va="top", ha="right",
-        fontsize=7.5, linespacing=1.5,
-        bbox=dict(boxstyle="round,pad=0.5", facecolor="#FAFAFA",
-                  edgecolor="#CCCCCC", alpha=0.92),
-        color="#1A1A2E")
-
-# --- Frame ---
-for spine in ax.spines.values():
-    spine.set_edgecolor("#888888")
-    spine.set_linewidth(0.7)
-
-plt.tight_layout(pad=1.0)
+    out_path = OUTPUT_DIR / "dong_da_static_map.png"
+    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Static map PNG: {out_path}")
 
 
-# =============================================================================
-# 10. SAVE OUTPUTS
-# =============================================================================
+def save_interactive_map(G: nx.MultiDiGraph) -> None:
+    """Save an interactive HTML map with road tooltips and optional layers."""
+    print("\n[MAP] Rendering interactive HTML map...")
 
-print("\n[6/6] Saving outputs...")
+    if folium is None:
+        print("  Folium is not installed. Run: pip install folium")
+        return
 
-# --- Save PNG map ---
-map_path = os.path.join(OUTPUT_DIR, "dong_da_gis_map.png")
-fig.savefig(map_path,
-            dpi=300,
-            bbox_inches="tight",
-            facecolor=fig.get_facecolor(),
-            format="png")
-print(f"  ✓ GIS Map PNG saved: {map_path}")
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
+    center_lat = float(nodes_gdf.geometry.y.mean())
+    center_lon = float(nodes_gdf.geometry.x.mean())
 
-plt.close(fig)
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=14,
+        tiles="cartodbpositron",
+        control_scale=True,
+    )
 
-# --- Save GraphML ---
-graphml_path = os.path.join(OUTPUT_DIR, "dong_da_graph.graphml")
-ox.save_graphml(G, filepath=graphml_path)
-print(f"  ✓ GraphML saved:     {graphml_path}")
+    optional_layers = [
+        ("Parks", "parks", "#7cb342", "#c8e6c9"),
+        ("Water", "water", "#42a5f5", "#b3d9ff"),
+        ("Buildings", "buildings", "#9e9e9e", "#d6cfc8"),
+    ]
+    for label, name, border_color, fill_color in optional_layers:
+        layer = load_saved_layer(name)
+        if layer is None or len(layer) == 0:
+            continue
+        folium.GeoJson(
+            layer,
+            name=label,
+            style_function=lambda _feature, bc=border_color, fc=fill_color: {
+                "color": bc,
+                "weight": 0.5,
+                "fillColor": fc,
+                "fillOpacity": 0.45,
+            },
+        ).add_to(m)
 
-# --- Save GeoJSON: Nodes ---
-nodes_export = nodes_gdf.copy()
-# GeoJSON không hỗ trợ list values — convert to string
-for col in nodes_export.columns:
-    if nodes_export[col].dtype == object:
-        nodes_export[col] = nodes_export[col].astype(str)
-nodes_path = os.path.join(OUTPUT_DIR, "dong_da_nodes.geojson")
-nodes_export.to_file(nodes_path, driver="GeoJSON")
-print(f"  ✓ Nodes GeoJSON:     {nodes_path}")
+    road_group = folium.FeatureGroup(name="Routing roads", show=True)
+    for _, row in edges_gdf.iterrows():
+        highway = normalize_highway(row.get("highway"))
+        color, width = INTERACTIVE_ROAD_STYLE.get(highway, ("#6b7280", 2))
+        road_name = display_value(row.get("name"))
+        length = to_float(row.get("length"), 0.0)
+        time_min = to_float(row.get("weight_time"), 0.0)
 
-# --- Save GeoJSON: Edges ---
-edges_export = edges_gdf.copy().reset_index()
-for col in edges_export.columns:
-    if edges_export[col].dtype == object:
-        edges_export[col] = edges_export[col].astype(str)
-# Giữ các columns quan trọng
-keep_cols = [
-    "u", "v", "key", "geometry", "highway", "name", "length",
-    "oneway", "speed_kph", "travel_time", "lanes", "maxspeed",
-    "weight_distance", "weight_time", "weight_congestion",
-    "weight_logistics", "congestion_factor", "capacity"
-]
-keep_cols = [c for c in keep_cols if c in edges_export.columns]
-edges_export = edges_export[keep_cols]
-edges_path = os.path.join(OUTPUT_DIR, "dong_da_edges.geojson")
-edges_export.to_file(edges_path, driver="GeoJSON")
-print(f"  ✓ Edges GeoJSON:     {edges_path}")
+        tooltip = (
+            f"{road_name}"
+            f" | {highway}"
+            f" | {length:.0f} m"
+            f" | {time_min:.1f} min"
+        )
 
-# --- Save feature layers ---
-if buildings_gdf is not None and len(buildings_gdf) > 0:
-    bld = buildings_gdf[["geometry"]].copy()
-    bld.to_file(os.path.join(OUTPUT_DIR, "dong_da_buildings.geojson"), driver="GeoJSON")
-    print(f"  ✓ Buildings GeoJSON: dong_da_buildings.geojson")
+        for path in iter_latlon_paths(row.geometry):
+            folium.PolyLine(
+                path,
+                color=color,
+                weight=width,
+                opacity=0.78,
+                tooltip=tooltip,
+            ).add_to(road_group)
 
-if water_gdf is not None and len(water_gdf) > 0:
-    w = water_gdf[["geometry"]].copy()
-    w.to_file(os.path.join(OUTPUT_DIR, "dong_da_water.geojson"), driver="GeoJSON")
-    print(f"  ✓ Water GeoJSON:     dong_da_water.geojson")
+    road_group.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
 
-if parks_gdf is not None and len(parks_gdf) > 0:
-    p = parks_gdf[["geometry"]].copy()
-    p.to_file(os.path.join(OUTPUT_DIR, "dong_da_parks.geojson"), driver="GeoJSON")
-    print(f"  ✓ Parks GeoJSON:     dong_da_parks.geojson")
+    out_path = OUTPUT_DIR / "dong_da_interactive_map.html"
+    m.save(out_path)
+    print(f"  Interactive map HTML: {out_path}")
 
 
-# =============================================================================
-# 11. SUMMARY & NEXT STEPS
-# =============================================================================
+def save_feature_layers() -> None:
+    """
+    Download useful GIS layers once and save them for dashboards/rendering.
 
-print("\n" + "=" * 70)
-print("  PART 1 COMPLETE — Road Graph Foundation Built")
-print("=" * 70)
-print(f"""
+    The routing graph does not depend on these layers, so failures here should
+    not block shortest path or VRP work.
+    """
+    print("\n[3/5] Downloading optional GIS feature layers...")
+
+    layers = {
+        "buildings": download_feature_layer({"building": True}, "Buildings"),
+        "parks": download_feature_layer(
+            {
+                "leisure": ["park", "garden", "recreation_ground"],
+                "landuse": ["grass", "meadow", "recreation_ground", "village_green"],
+            },
+            "Parks/Green",
+        ),
+        "water": download_feature_layer(
+            {
+                "natural": ["water", "wetland"],
+                "waterway": ["riverbank"],
+                "landuse": ["reservoir", "basin"],
+            },
+            "Water",
+        ),
+    }
+
+    for name, gdf in layers.items():
+        if gdf is None or len(gdf) == 0:
+            continue
+        out_path = OUTPUT_DIR / f"dong_da_{name}.geojson"
+        clean_object_columns(gdf[["geometry"]].copy()).to_file(out_path, driver="GeoJSON")
+        print(f"  {name.title()} GeoJSON: {out_path}")
+
+
+def print_summary(G: nx.MultiDiGraph) -> None:
+    edges = ox.graph_to_gdfs(G, nodes=False, edges=True)
+    highway_counts = edges["highway"].value_counts().head(12)
+    total_km = edges["length"].sum() / 1000.0 if "length" in edges.columns else 0.0
+
+    print("\n" + "=" * 70)
+    print("  PART 1 COMPLETE — Optimized Routing Graph Built")
+    print("=" * 70)
+    print(f"""
 GRAPH SUMMARY:
-  • Type        : {type(G).__name__} (Directed + Multi-edge)
-  • Nodes       : {G.number_of_nodes():,}  (intersections + geometry points)
-  • Edges       : {G.number_of_edges():,}  (road segments, directed)
-  • simplify    : False  (full curved road geometry retained)
-  • CRS         : EPSG:4326 (WGS84)
+  Type        : {type(G).__name__}
+  Nodes       : {G.number_of_nodes():,}
+  Edges       : {G.number_of_edges():,}
+  simplify    : True  (faster routing, edge geometry retained)
+  component   : Largest weakly connected component
+  CRS         : {G.graph.get("crs", "unknown")}
+  Length      : {total_km:.1f} km
 
-EDGE WEIGHTS AVAILABLE:
-  • weight_distance  — minimize fuel/distance (km)
-  • weight_time      — minimize delivery time (minutes)
-  • weight_congestion— time × congestion factor (peak hour)
-  • weight_logistics — composite: time + fuel cost (VND)
+EDGE WEIGHTS:
+  weight_distance   — distance in km
+  weight_time       — travel time in minutes
+  weight_congestion — time × congestion factor
+  weight_logistics  — composite VND-like cost
 
-OUTPUT FILES (./dong_da_output/):
-  • dong_da_gis_map.png       — High-res GIS map (300 DPI)
-  • dong_da_graph.graphml     — Load with: ox.load_graphml(path)
-  • dong_da_nodes.geojson     — Intersections with lat/lon
-  • dong_da_edges.geojson     — Roads with all weights
-  • dong_da_buildings.geojson — Building footprints
-  • dong_da_water.geojson     — Water bodies
-  • dong_da_parks.geojson     — Parks & green spaces
-
-READY FOR PART 2 — LOGISTICS ALGORITHMS:
-  # Load graph
-  G = ox.load_graphml("./dong_da_output/dong_da_graph.graphml")
-
-  # Shortest path (by time)
-  path = nx.shortest_path(G, source=u, target=v,
-                           weight="weight_time")
-
-  # Shortest path (by logistics cost)
-  path = nx.shortest_path(G, source=u, target=v,
-                           weight="weight_logistics")
-
-  # Nearest node to a GPS coordinate
-  node = ox.nearest_nodes(G, X=105.8412, Y=21.0285)
-
-  # Load edges as GeoDataFrame
-  _, edges = ox.graph_to_gdfs(G)
+OUTPUT FILES:
+  {OUTPUT_DIR / "dong_da_graph.graphml"}
+  {OUTPUT_DIR / "dong_da_nodes.geojson"}
+  {OUTPUT_DIR / "dong_da_edges.geojson"}
+  {OUTPUT_DIR / "dong_da_buildings.geojson"}
+  {OUTPUT_DIR / "dong_da_parks.geojson"}
+  {OUTPUT_DIR / "dong_da_water.geojson"}
 """)
 
+    print("TOP ROAD TYPES:")
+    for road_type, count in highway_counts.items():
+        bar = "#" * min(int(count / max(highway_counts.max(), 1) * 30), 30)
+        print(f"  {str(road_type):18s}: {count:5,}  {bar}")
 
-# =============================================================================
-# 12. BONUS: QUICK CONGESTION ANALYSIS DEMO
-# =============================================================================
+    print("\nREADY FOR PART 2:")
+    print('  G = ox.load_graphml("./dong_da_output/dong_da_graph.graphml")')
+    print('  path = nx.shortest_path(G, source=u, target=v, weight="weight_time")')
+    print("=" * 70)
 
-print("BONUS: Congestion analysis demo...")
 
-# Đường nào có congestion factor cao nhất?
-if "congestion_factor" in edges_gdf.columns:
-    top_congested = (
-        edges_gdf
-        .assign(highway_str=highway_col)
-        .groupby("highway_str")["congestion_factor"]
-        .mean()
-        .sort_values(ascending=False)
-        .head(8)
-    )
-    print("\n  Average congestion factor by road type:")
-    for rt, cf in top_congested.items():
-        bar = "█" * int(cf * 5)
-        print(f"    {rt:20s}: {cf:.2f}  {bar}")
+def main() -> None:
+    print("=" * 70)
+    print("  CITY LOGISTICS & ROUTING — PART 1 OPTIMIZED")
+    print("  Dong Da District, Hanoi, Vietnam")
+    print("=" * 70)
 
-# Tổng chiều dài network
-if "length" in edges_gdf.columns:
-    total_km = edges_gdf["length"].sum() / 1000
-    print(f"\n  Total road network length: {total_km:.1f} km")
-    print(f"  Average edge length:       {edges_gdf['length'].mean():.1f} m")
-    print(f"  Road density:              {total_km:.0f} km in Dong Da District")
+    G = build_routing_graph()
 
-print("\n✓ All done! Check ./dong_da_output/ for all files.")
-print("=" * 70)
+    print("\n[2/5] Adding logistics weights...")
+    G = add_logistics_weights(G)
+    print("  Added: distance, time, congestion, logistics cost, capacity")
+
+    save_feature_layers()
+    export_outputs(G)
+    save_static_map(G)
+    save_interactive_map(G)
+    print_summary(G)
+
+
+if __name__ == "__main__":
+    main()
+
