@@ -1,1 +1,698 @@
 
+# bai-tap-dsa
+bai tap nhom dsa city routing
+
+"""
+"""
+"""
+=============================================================================
+CITY LOGISTICS & ROUTING SYSTEM — PART 1 OPTIMIZED
+=============================================================================
+Area    : Dong Da District, Hanoi, Vietnam
+Goal    : Build a practical routing graph for shortest path, VRP, shipper
+          allocation, congestion simulation, and logistics optimization.
+
+Key improvements vs the original Part 1:
+  - Uses simplify=True for routing performance while preserving edge geometry.
+  - Filters roads that are unsuitable for motorcycle/vehicle logistics.
+  - Keeps the largest weakly connected component to reduce unreachable pairs.
+  - Separates routing graph concerns from GIS rendering/export.
+  - Normalizes OSM attributes and numeric edge weights before saving.
+  - Exports compact GeoJSON with only useful routing attributes.
+=============================================================================
+"""
+
+from __future__ import annotations
+
+import os
+import time
+import warnings
+from pathlib import Path
+from typing import Any
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import networkx as nx
+import osmnx as ox
+import pandas as pd
+
+try:
+    import folium
+except ImportError:
+    folium = None
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+)
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+PLACE = "Đống Đa, Hà Nội, Việt Nam"
+OUTPUT_DIR = Path("./dong_da_output")
+CACHE_DIR = Path("./osm_cache")
+
+OUTPUT_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(exist_ok=True)
+
+ox.settings.log_console = True
+ox.settings.use_cache = True
+ox.settings.cache_folder = str(CACHE_DIR)
+ox.settings.timeout = 300
+
+
+# Speeds are tuned for inner-city Hanoi motorcycle/logistics routing.
+# Unit: km/h.
+HEURISTIC_SPEEDS = {
+    "motorway": 70,
+    "trunk": 55,
+    "primary": 40,
+    "secondary": 32,
+    "tertiary": 26,
+    "residential": 22,
+    "service": 14,
+    "unclassified": 18,
+    "living_street": 10,
+    "road": 20,
+}
+
+# Roads that should not be used for vehicle/motorcycle logistics.
+BLOCKED_HIGHWAYS = {
+    "footway",
+    "steps",
+    "pedestrian",
+    "cycleway",
+    "bridleway",
+    "corridor",
+    "elevator",
+    "escalator",
+    "platform",
+    "proposed",
+    "construction",
+}
+
+NO_ACCESS_VALUES = {"no", "private", "customers", "permit"}
+
+EXPORT_EDGE_COLUMNS = [
+    "u",
+    "v",
+    "key",
+    "geometry",
+    "osmid",
+    "highway",
+    "name",
+    "length",
+    "oneway",
+    "lanes",
+    "maxspeed",
+    "speed_kph",
+    "travel_time",
+    "weight_distance",
+    "weight_time",
+    "weight_congestion",
+    "weight_logistics",
+    "congestion_factor",
+    "capacity",
+]
+
+STATIC_ROAD_STYLE = {
+    "motorway": ("#e67e22", "#f39c12", 3.2, 2.0, 9, 1.0),
+    "trunk": ("#e67e22", "#f39c12", 3.0, 1.9, 9, 1.0),
+    "primary": ("#d97706", "#fbbf24", 2.6, 1.6, 8, 1.0),
+    "secondary": ("#9ca3af", "#ffffff", 2.0, 1.2, 7, 1.0),
+    "tertiary": ("#9ca3af", "#ffffff", 1.5, 0.9, 6, 0.95),
+    "residential": ("#a3a3a3", "#ffffff", 1.1, 0.7, 5, 0.9),
+    "service": ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
+    "living_street": ("#bdbdbd", "#f3f4f6", 0.8, 0.45, 4, 0.82),
+    "unclassified": ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
+    "road": ("#a3a3a3", "#ffffff", 1.0, 0.65, 5, 0.9),
+    "_default": ("#bdbdbd", "#dddddd", 0.7, 0.4, 3, 0.75),
+}
+
+INTERACTIVE_ROAD_STYLE = {
+    "motorway": ("#e67e22", 5),
+    "trunk": ("#e67e22", 5),
+    "primary": ("#f59e0b", 4),
+    "secondary": ("#facc15", 3),
+    "tertiary": ("#2563eb", 3),
+    "residential": ("#6b7280", 2),
+    "service": ("#9ca3af", 2),
+    "living_street": ("#9ca3af", 2),
+    "unclassified": ("#9ca3af", 2),
+    "road": ("#6b7280", 2),
+}
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def first_value(value: Any, default: Any = None) -> Any:
+    """Return the first scalar value from common OSM list-like attributes."""
+    if isinstance(value, (list, tuple, set)):
+        return next(iter(value), default)
+    return value if value is not None else default
+
+
+def to_float(value: Any, default: float) -> float:
+    """Convert OSM string/list values to float safely."""
+    value = first_value(value, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def to_int(value: Any, default: int) -> int:
+    """Convert OSM string/list values to int safely."""
+    value = first_value(value, default)
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_highway(value: Any) -> str:
+    """Normalize an OSM highway attribute to a single lowercase string."""
+    value = first_value(value, "unclassified")
+    return str(value).lower() if value is not None else "unclassified"
+
+
+def is_blocked_for_logistics(edge_data: dict[str, Any]) -> bool:
+    """
+    Decide whether an OSM edge is unsuitable for logistics routing.
+
+    This is conservative: it removes explicit pedestrian/cycle-only facilities
+    and edges with clear vehicle or motorcycle access restrictions.
+    """
+    highway = normalize_highway(edge_data.get("highway"))
+    if highway in BLOCKED_HIGHWAYS:
+        return True
+
+    access = str(first_value(edge_data.get("access"), "")).lower()
+    vehicle = str(first_value(edge_data.get("vehicle"), "")).lower()
+    motor_vehicle = str(first_value(edge_data.get("motor_vehicle"), "")).lower()
+    motorcycle = str(first_value(edge_data.get("motorcycle"), "")).lower()
+
+    if access in NO_ACCESS_VALUES:
+        return True
+    if vehicle == "no" or motor_vehicle == "no" or motorcycle == "no":
+        return True
+
+    return False
+
+
+def keep_largest_component(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Keep the largest weakly connected component for directed road graphs."""
+    if G.number_of_nodes() == 0:
+        return G
+    if nx.is_weakly_connected(G):
+        return G
+
+    largest = max(nx.weakly_connected_components(G), key=len)
+    return G.subgraph(largest).copy()
+
+
+def clean_object_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Make GeoJSON export robust by converting unsupported object values.
+
+    Geometry is left untouched. Lists/dicts are stringified; normal scalar values
+    are kept as-is where possible.
+    """
+    cleaned = gdf.copy()
+    for col in cleaned.columns:
+        if col == cleaned.geometry.name:
+            continue
+        if cleaned[col].dtype == object:
+            cleaned[col] = cleaned[col].map(
+                lambda x: ", ".join(map(str, x))
+                if isinstance(x, (list, tuple, set))
+                else str(x)
+                if isinstance(x, dict)
+                else x
+            )
+    return cleaned
+
+
+def display_value(value: Any, default: str = "Unnamed road") -> str:
+    """Convert OSM scalar/list values to a readable string for map labels."""
+    if value is None:
+        return default
+    if isinstance(value, float) and pd.isna(value):
+        return default
+    if isinstance(value, (list, tuple, set)):
+        values = [str(item) for item in value if item is not None and not pd.isna(item)]
+        return ", ".join(values) if values else default
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return default
+    return text
+
+
+def add_logistics_weights(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Add routing weights needed by later shortest path and VRP stages."""
+    G = ox.add_edge_speeds(G, hwy_speeds=HEURISTIC_SPEEDS)
+    G = ox.add_edge_travel_times(G)
+
+    congestion_by_highway = {
+        "motorway": 1.15,
+        "trunk": 1.30,
+        "primary": 1.75,
+        "secondary": 1.55,
+        "tertiary": 1.30,
+        "residential": 1.12,
+        "service": 1.05,
+        "living_street": 1.05,
+        "unclassified": 1.12,
+        "road": 1.15,
+    }
+
+    fuel_cost_per_km = 2000.0
+    time_value_per_min = 500.0
+
+    for _, _, _, data in G.edges(keys=True, data=True):
+        highway = normalize_highway(data.get("highway"))
+        length_m = to_float(data.get("length"), 50.0)
+        speed_kph = to_float(data.get("speed_kph"), HEURISTIC_SPEEDS.get(highway, 20))
+        travel_time_s = to_float(data.get("travel_time"), length_m / max(speed_kph, 1) * 3.6)
+        lanes = max(to_int(data.get("lanes"), 1), 1)
+
+        congestion = congestion_by_highway.get(highway, 1.12)
+        distance_km = length_m / 1000.0
+        time_min = travel_time_s / 60.0
+
+        data["highway"] = highway
+        data["length"] = length_m
+        data["speed_kph"] = speed_kph
+        data["travel_time"] = travel_time_s
+        data["lanes"] = lanes
+        data["weight_distance"] = distance_km
+        data["weight_time"] = time_min
+        data["congestion_factor"] = congestion
+        data["weight_congestion"] = time_min * congestion
+        data["weight_logistics"] = (
+            time_min * time_value_per_min * congestion
+            + distance_km * fuel_cost_per_km
+        )
+        data["capacity"] = lanes * speed_kph
+
+    return G
+
+
+def build_routing_graph() -> nx.MultiDiGraph:
+    """
+    Download and prepare a practical logistics routing graph.
+
+    simplify=True is intentional: OSMnx preserves road geometry on simplified
+    edges, but the graph has far fewer routing states than simplify=False.
+    """
+    print("\n[1/5] Downloading routing graph...")
+    print(f"      Place: {PLACE}")
+    print("      network_type=all, simplify=True, retain_all=False")
+
+    start = time.time()
+    G = ox.graph_from_place(
+        PLACE,
+        network_type="all",
+        simplify=True,
+        retain_all=False,
+        truncate_by_edge=True,
+    )
+
+    raw_nodes = G.number_of_nodes()
+    raw_edges = G.number_of_edges()
+
+    blocked_edges = [
+        (u, v, k)
+        for u, v, k, data in G.edges(keys=True, data=True)
+        if is_blocked_for_logistics(data)
+    ]
+    G.remove_edges_from(blocked_edges)
+    G.remove_nodes_from(list(nx.isolates(G)))
+    G = keep_largest_component(G)
+
+    elapsed = time.time() - start
+    print(f"  Raw graph:       {raw_nodes:,} nodes | {raw_edges:,} edges")
+    print(f"  Removed edges:   {len(blocked_edges):,}")
+    print(f"  Routing graph:   {G.number_of_nodes():,} nodes | {G.number_of_edges():,} edges")
+    print(f"  Download/clean:  {elapsed:.1f}s")
+
+    return G
+
+
+def download_feature_layer(tags: dict[str, Any], layer_name: str) -> gpd.GeoDataFrame | None:
+    """Download polygon GIS features for optional map/dashboard use."""
+    try:
+        gdf = ox.features_from_place(PLACE, tags=tags)
+        gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
+        print(f"  {layer_name}: {len(gdf):,} polygons")
+        return gdf
+    except Exception as exc:
+        print(f"  {layer_name}: skipped ({exc})")
+        return None
+
+
+def export_outputs(G: nx.MultiDiGraph) -> None:
+    """Save GraphML, nodes GeoJSON, edges GeoJSON, and compact GIS layers."""
+    print("\n[4/5] Converting graph to GeoDataFrames...")
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
+
+    print(f"  Nodes GDF: {len(nodes_gdf):,} rows | CRS: {nodes_gdf.crs}")
+    print(f"  Edges GDF: {len(edges_gdf):,} rows | CRS: {edges_gdf.crs}")
+
+    print("\n[5/5] Saving outputs...")
+
+    graphml_path = OUTPUT_DIR / "dong_da_graph.graphml"
+    ox.save_graphml(G, filepath=graphml_path)
+    print(f"  GraphML:       {graphml_path}")
+
+    nodes_path = OUTPUT_DIR / "dong_da_nodes.geojson"
+    nodes_export = clean_object_columns(nodes_gdf)
+    nodes_export.to_file(nodes_path, driver="GeoJSON")
+    print(f"  Nodes GeoJSON: {nodes_path}")
+
+    edges_path = OUTPUT_DIR / "dong_da_edges.geojson"
+    edges_export = clean_object_columns(edges_gdf.reset_index())
+    keep_cols = [col for col in EXPORT_EDGE_COLUMNS if col in edges_export.columns]
+    edges_export = edges_export[keep_cols]
+    edges_export.to_file(edges_path, driver="GeoJSON")
+    print(f"  Edges GeoJSON: {edges_path}")
+
+
+def load_saved_layer(name: str) -> gpd.GeoDataFrame | None:
+    """Load an optional saved GeoJSON layer if it exists."""
+    path = OUTPUT_DIR / f"dong_da_{name}.geojson"
+    if not path.exists():
+        return None
+    try:
+        return gpd.read_file(path)
+    except Exception:
+        return None
+
+
+def static_road_style(highway: Any) -> tuple[str, str, float, float, int, float]:
+    highway = normalize_highway(highway)
+    return STATIC_ROAD_STYLE.get(highway, STATIC_ROAD_STYLE["_default"])
+
+
+def iter_latlon_paths(geometry: Any):
+    """Yield Folium-ready [(lat, lon), ...] paths from line geometries."""
+    if geometry is None or geometry.is_empty:
+        return
+    if geometry.geom_type == "LineString":
+        yield [(lat, lon) for lon, lat in geometry.coords]
+    elif geometry.geom_type == "MultiLineString":
+        for part in geometry.geoms:
+            yield [(lat, lon) for lon, lat in part.coords]
+
+
+def save_static_map(G: nx.MultiDiGraph) -> None:
+    """Save a static, report-friendly PNG map of the optimized graph."""
+    print("\n[MAP] Rendering static PNG map...")
+
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
+    buildings = load_saved_layer("buildings")
+    parks = load_saved_layer("parks")
+    water = load_saved_layer("water")
+
+    fig, ax = plt.subplots(1, 1, figsize=(18, 20), dpi=220, facecolor="#f4efe7")
+    ax.set_facecolor("#f4efe7")
+
+    bounds = nodes_gdf.total_bounds
+    margin = 0.004
+    ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
+    ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
+
+    if parks is not None and len(parks) > 0:
+        parks.plot(
+            ax=ax,
+            color="#c8e6c9",
+            edgecolor="#a5d6a7",
+            linewidth=0.25,
+            alpha=0.85,
+            zorder=1,
+        )
+
+    if water is not None and len(water) > 0:
+        water.plot(
+            ax=ax,
+            color="#b3d9ff",
+            edgecolor="#90c4e8",
+            linewidth=0.35,
+            alpha=0.92,
+            zorder=2,
+        )
+
+    if buildings is not None and len(buildings) > 0:
+        buildings.plot(
+            ax=ax,
+            color="#d6cfc8",
+            edgecolor="#bdb5ad",
+            linewidth=0.08,
+            alpha=0.72,
+            zorder=3,
+        )
+
+    highway_col = edges_gdf["highway"].map(normalize_highway)
+    render_order = [
+        "service",
+        "living_street",
+        "unclassified",
+        "road",
+        "residential",
+        "tertiary",
+        "secondary",
+        "primary",
+        "trunk",
+        "motorway",
+    ]
+
+    other_types = [t for t in highway_col.unique() if t not in render_order]
+    for road_type in other_types + render_order:
+        subset = edges_gdf[highway_col == road_type]
+        if len(subset) == 0:
+            continue
+
+        outline, fill, outline_width, fill_width, zorder, alpha = static_road_style(road_type)
+        subset.plot(
+            ax=ax,
+            color=outline,
+            linewidth=outline_width,
+            alpha=alpha * 0.65,
+            zorder=zorder,
+            capstyle="round",
+            joinstyle="round",
+        )
+        subset.plot(
+            ax=ax,
+            color=fill,
+            linewidth=fill_width,
+            alpha=alpha,
+            zorder=zorder + 0.1,
+            capstyle="round",
+            joinstyle="round",
+        )
+
+    ax.set_title(
+        "Dong Da District - Optimized Logistics Road Graph",
+        fontsize=15,
+        fontweight="bold",
+        loc="left",
+        pad=12,
+        color="#111827",
+    )
+    ax.text(
+        1.0,
+        1.01,
+        "OpenStreetMap | OSMnx + GeoPandas",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        color="#6b7280",
+    )
+    ax.set_axis_off()
+
+    out_path = OUTPUT_DIR / "dong_da_static_map.png"
+    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Static map PNG: {out_path}")
+
+
+def save_interactive_map(G: nx.MultiDiGraph) -> None:
+    """Save an interactive HTML map with road tooltips and optional layers."""
+    print("\n[MAP] Rendering interactive HTML map...")
+
+    if folium is None:
+        print("  Folium is not installed. Run: pip install folium")
+        return
+
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
+    center_lat = float(nodes_gdf.geometry.y.mean())
+    center_lon = float(nodes_gdf.geometry.x.mean())
+
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=14,
+        tiles="cartodbpositron",
+        control_scale=True,
+    )
+
+    optional_layers = [
+        ("Parks", "parks", "#7cb342", "#c8e6c9"),
+        ("Water", "water", "#42a5f5", "#b3d9ff"),
+        ("Buildings", "buildings", "#9e9e9e", "#d6cfc8"),
+    ]
+    for label, name, border_color, fill_color in optional_layers:
+        layer = load_saved_layer(name)
+        if layer is None or len(layer) == 0:
+            continue
+        folium.GeoJson(
+            layer,
+            name=label,
+            style_function=lambda _feature, bc=border_color, fc=fill_color: {
+                "color": bc,
+                "weight": 0.5,
+                "fillColor": fc,
+                "fillOpacity": 0.45,
+            },
+        ).add_to(m)
+
+    road_group = folium.FeatureGroup(name="Routing roads", show=True)
+    for _, row in edges_gdf.iterrows():
+        highway = normalize_highway(row.get("highway"))
+        color, width = INTERACTIVE_ROAD_STYLE.get(highway, ("#6b7280", 2))
+        road_name = display_value(row.get("name"))
+        length = to_float(row.get("length"), 0.0)
+        time_min = to_float(row.get("weight_time"), 0.0)
+
+        tooltip = (
+            f"{road_name}"
+            f" | {highway}"
+            f" | {length:.0f} m"
+            f" | {time_min:.1f} min"
+        )
+
+        for path in iter_latlon_paths(row.geometry):
+            folium.PolyLine(
+                path,
+                color=color,
+                weight=width,
+                opacity=0.78,
+                tooltip=tooltip,
+            ).add_to(road_group)
+
+    road_group.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    out_path = OUTPUT_DIR / "dong_da_interactive_map.html"
+    m.save(out_path)
+    print(f"  Interactive map HTML: {out_path}")
+
+
+def save_feature_layers() -> None:
+    """
+    Download useful GIS layers once and save them for dashboards/rendering.
+
+    The routing graph does not depend on these layers, so failures here should
+    not block shortest path or VRP work.
+    """
+    print("\n[3/5] Downloading optional GIS feature layers...")
+
+    layers = {
+        "buildings": download_feature_layer({"building": True}, "Buildings"),
+        "parks": download_feature_layer(
+            {
+                "leisure": ["park", "garden", "recreation_ground"],
+                "landuse": ["grass", "meadow", "recreation_ground", "village_green"],
+            },
+            "Parks/Green",
+        ),
+        "water": download_feature_layer(
+            {
+                "natural": ["water", "wetland"],
+                "waterway": ["riverbank"],
+                "landuse": ["reservoir", "basin"],
+            },
+            "Water",
+        ),
+    }
+
+    for name, gdf in layers.items():
+        if gdf is None or len(gdf) == 0:
+            continue
+        out_path = OUTPUT_DIR / f"dong_da_{name}.geojson"
+        clean_object_columns(gdf[["geometry"]].copy()).to_file(out_path, driver="GeoJSON")
+        print(f"  {name.title()} GeoJSON: {out_path}")
+
+
+def print_summary(G: nx.MultiDiGraph) -> None:
+    edges = ox.graph_to_gdfs(G, nodes=False, edges=True)
+    highway_counts = edges["highway"].value_counts().head(12)
+    total_km = edges["length"].sum() / 1000.0 if "length" in edges.columns else 0.0
+
+    print("\n" + "=" * 70)
+    print("  PART 1 COMPLETE — Optimized Routing Graph Built")
+    print("=" * 70)
+    print(f"""
+GRAPH SUMMARY:
+  Type        : {type(G).__name__}
+  Nodes       : {G.number_of_nodes():,}
+  Edges       : {G.number_of_edges():,}
+  simplify    : True  (faster routing, edge geometry retained)
+  component   : Largest weakly connected component
+  CRS         : {G.graph.get("crs", "unknown")}
+  Length      : {total_km:.1f} km
+
+EDGE WEIGHTS:
+  weight_distance   — distance in km
+  weight_time       — travel time in minutes
+  weight_congestion — time × congestion factor
+  weight_logistics  — composite VND-like cost
+
+OUTPUT FILES:
+  {OUTPUT_DIR / "dong_da_graph.graphml"}
+  {OUTPUT_DIR / "dong_da_nodes.geojson"}
+  {OUTPUT_DIR / "dong_da_edges.geojson"}
+  {OUTPUT_DIR / "dong_da_buildings.geojson"}
+  {OUTPUT_DIR / "dong_da_parks.geojson"}
+  {OUTPUT_DIR / "dong_da_water.geojson"}
+""")
+
+    print("TOP ROAD TYPES:")
+    for road_type, count in highway_counts.items():
+        bar = "#" * min(int(count / max(highway_counts.max(), 1) * 30), 30)
+        print(f"  {str(road_type):18s}: {count:5,}  {bar}")
+
+    print("\nREADY FOR PART 2:")
+    print('  G = ox.load_graphml("./dong_da_output/dong_da_graph.graphml")')
+    print('  path = nx.shortest_path(G, source=u, target=v, weight="weight_time")')
+    print("=" * 70)
+
+
+def main() -> None:
+    print("=" * 70)
+    print("  CITY LOGISTICS & ROUTING — PART 1 OPTIMIZED")
+    print("  Dong Da District, Hanoi, Vietnam")
+    print("=" * 70)
+
+    G = build_routing_graph()
+
+    print("\n[2/5] Adding logistics weights...")
+    G = add_logistics_weights(G)
+    print("  Added: distance, time, congestion, logistics cost, capacity")
+
+    save_feature_layers()
+    export_outputs(G)
+    save_static_map(G)
+    save_interactive_map(G)
+    print_summary(G)
+
+
+if __name__ == "__main__":
+    main()
+
