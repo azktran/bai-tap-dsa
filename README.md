@@ -1337,7 +1337,7 @@ def part3_zone_division(G: nx.MultiDiGraph | None = None) -> dict[str, Any]:
     weights = [float(d["weight_kg"]) for d in deliveries]
 
     uf = UnionFind(len(deliveries))
-    merge_radius_m = 650.0
+    merge_radius_m = 150.0
     for i in range(len(coords)):
         for j in range(i + 1, len(coords)):
             if haversine_m(coords[i], coords[j]) <= merge_radius_m:
