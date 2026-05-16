@@ -93,44 +93,77 @@ def order_idx_to_matrix_index(order_idx: int) -> int:
     return order_idx + N_DEPOTS
 
 
-def node_latlon(G: nx.MultiDiGraph, node: Any) -> tuple[float, float]:
-    data = G.nodes[str(node)]
+# ── FIX 1: node_latlon returns None if node is missing ───────────────────────
+def node_latlon(G: nx.MultiDiGraph, node: Any) -> tuple[float, float] | None:
+    """Return (lat, lon) for node, or None if the node is not in G."""
+    key = str(node)
+    if key not in G.nodes:
+        return None
+    data = G.nodes[key]
     return float(data["y"]), float(data["x"])
 
 
 def haversine_heuristic(G: nx.MultiDiGraph, target: Any):
-    t_lat, t_lon = node_latlon(G, target)
+    t_ll = node_latlon(G, target)
+    if t_ll is None:
+        return lambda u, v: 0.0
+    t_lat, t_lon = t_ll
 
     def _h(u, v):
-        u_lat, u_lon = node_latlon(G, u)
+        u_ll = node_latlon(G, u)
+        if u_ll is None:
+            return 0.0
+        u_lat, u_lon = u_ll
         dlat = math.radians(t_lat - u_lat)
         dlon = math.radians(t_lon - u_lon)
-        a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(u_lat)) * math.cos(math.radians(t_lat)) * math.sin(dlon / 2) ** 2
+        a = (math.sin(dlat / 2) ** 2
+             + math.cos(math.radians(u_lat))
+             * math.cos(math.radians(t_lat))
+             * math.sin(dlon / 2) ** 2)
         dist_m = 6371000 * 2 * math.asin(math.sqrt(a))
         return dist_m / 1000.0 / 60.0
 
     return _h
 
 
-def edge_latlon_path(G: nx.MultiDiGraph, u: Any, v: Any, weight: str = "weight_time") -> list[tuple[float, float]]:
-    u = str(u)
-    v = str(v)
+# ── FIX 2: edge_latlon_path guards against missing nodes ─────────────────────
+def edge_latlon_path(
+    G: nx.MultiDiGraph, u: Any, v: Any, weight: str = "weight_time"
+) -> list[tuple[float, float]]:
+    u, v = str(u), str(v)
+    u_ll = node_latlon(G, u)
+    v_ll = node_latlon(G, v)
+
+    if u_ll is None and v_ll is None:
+        return []
+    if u_ll is None:
+        return [v_ll]
+    if v_ll is None:
+        return [u_ll]
+
     edge_dict = G.get_edge_data(u, v)
     if not edge_dict:
-        return [node_latlon(G, u), node_latlon(G, v)]
+        return [u_ll, v_ll]
     _, data = min(
         edge_dict.items(),
-        key=lambda item: to_float(item[1].get(weight), to_float(item[1].get("length"), 1.0)),
+        key=lambda item: to_float(
+            item[1].get(weight), to_float(item[1].get("length"), 1.0)
+        ),
     )
     geometry = data.get("geometry")
     if geometry is not None and hasattr(geometry, "coords"):
         return [(lat, lon) for lon, lat in geometry.coords]
-    return [node_latlon(G, u), node_latlon(G, v)]
+    return [u_ll, v_ll]
 
 
-def route_latlon_path(G: nx.MultiDiGraph, route_nodes: list[Any]) -> list[tuple[float, float]]:
+# ── FIX 3: route_latlon_path skips edges with missing nodes ──────────────────
+def route_latlon_path(
+    G: nx.MultiDiGraph, route_nodes: list[Any]
+) -> list[tuple[float, float]]:
     full_path: list[tuple[float, float]] = []
     for u, v in zip(route_nodes[:-1], route_nodes[1:]):
+        if str(u) not in G.nodes or str(v) not in G.nodes:
+            continue
         segment = edge_latlon_path(G, u, v)
         if full_path and segment:
             segment = segment[1:]
@@ -138,7 +171,9 @@ def route_latlon_path(G: nx.MultiDiGraph, route_nodes: list[Any]) -> list[tuple[
     return full_path
 
 
-def shortest_node_route(G: nx.MultiDiGraph, src: Any, dst: Any, weight: str = "weight_time") -> list[str]:
+def shortest_node_route(
+    G: nx.MultiDiGraph, src: Any, dst: Any, weight: str = "weight_time"
+) -> list[str]:
     try:
         _, path = nx.bidirectional_dijkstra(G, str(src), str(dst), weight=weight)
         return path
@@ -146,7 +181,9 @@ def shortest_node_route(G: nx.MultiDiGraph, src: Any, dst: Any, weight: str = "w
         return []
 
 
-def tw_penalty_score(arrival_min: float, tw_open_str: str, tw_close_str: str) -> float:
+def tw_penalty_score(
+    arrival_min: float, tw_open_str: str, tw_close_str: str
+) -> float:
     open_min = int(tw_open_str[:2]) * 60 + int(tw_open_str[3:])
     close_min = int(tw_close_str[:2]) * 60 + int(tw_close_str[3:])
     if arrival_min < open_min:
@@ -245,7 +282,9 @@ def generate_delivery_points(G: nx.MultiDiGraph) -> tuple[list, list, list]:
     return depots, deliveries, depots + deliveries
 
 
-def build_point_metadata(G: nx.MultiDiGraph, depots: list, deliveries: list) -> dict[str, Any]:
+def build_point_metadata(
+    G: nx.MultiDiGraph, depots: list, deliveries: list
+) -> dict[str, Any]:
     rng = random.Random(RANDOM_SEED)
     return {
         "depots": [
@@ -291,7 +330,9 @@ def load_layer_geojson(filename: str):
             return None
 
 
-def plot_part1_detailed_base(ax: Any, G: nx.MultiDiGraph, title: str, show_title: bool = True) -> None:
+def plot_part1_detailed_base(
+    ax: Any, G: nx.MultiDiGraph, title: str, show_title: bool = True
+) -> None:
     nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
     ax.set_facecolor("#f4efe7")
     bounds = nodes_gdf.total_bounds
@@ -300,8 +341,8 @@ def plot_part1_detailed_base(ax: Any, G: nx.MultiDiGraph, title: str, show_title
     ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
 
     for filename, color, edge, alpha, zorder in [
-        ("dong_da_parks.geojson", "#c8e6c9", "#a5d6a7", 0.85, 1),
-        ("dong_da_water.geojson", "#b3d9ff", "#90c4e8", 0.92, 2),
+        ("dong_da_parks.geojson",     "#c8e6c9", "#a5d6a7", 0.85, 1),
+        ("dong_da_water.geojson",     "#b3d9ff", "#90c4e8", 0.92, 2),
         ("dong_da_buildings.geojson", "#d6cfc8", "#bdb5ad", 0.72, 3),
     ]:
         layer = load_layer_geojson(filename)
@@ -313,16 +354,16 @@ def plot_part1_detailed_base(ax: Any, G: nx.MultiDiGraph, title: str, show_title
             )
 
     style = {
-        "motorway":     ("#e67e22", "#f39c12", 3.2, 2.0, 9, 1.0),
-        "trunk":        ("#e67e22", "#f39c12", 3.0, 1.9, 9, 1.0),
-        "primary":      ("#d97706", "#fbbf24", 2.6, 1.6, 8, 1.0),
-        "secondary":    ("#9ca3af", "#ffffff", 2.0, 1.2, 7, 1.0),
-        "tertiary":     ("#9ca3af", "#ffffff", 1.5, 0.9, 6, 0.95),
-        "residential":  ("#a3a3a3", "#ffffff", 1.1, 0.7, 5, 0.9),
-        "service":      ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
-        "living_street":("#bdbdbd", "#f3f4f6", 0.8, 0.45, 4, 0.82),
-        "unclassified": ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
-        "road":         ("#a3a3a3", "#ffffff", 1.0, 0.65, 5, 0.9),
+        "motorway":      ("#e67e22", "#f39c12", 3.2, 2.0, 9, 1.0),
+        "trunk":         ("#e67e22", "#f39c12", 3.0, 1.9, 9, 1.0),
+        "primary":       ("#d97706", "#fbbf24", 2.6, 1.6, 8, 1.0),
+        "secondary":     ("#9ca3af", "#ffffff", 2.0, 1.2, 7, 1.0),
+        "tertiary":      ("#9ca3af", "#ffffff", 1.5, 0.9, 6, 0.95),
+        "residential":   ("#a3a3a3", "#ffffff", 1.1, 0.7, 5, 0.9),
+        "service":       ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
+        "living_street": ("#bdbdbd", "#f3f4f6", 0.8, 0.45, 4, 0.82),
+        "unclassified":  ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
+        "road":          ("#a3a3a3", "#ffffff", 1.0, 0.65, 5, 0.9),
     }
     highway_col = edges_gdf["highway"].map(lambda v: str(v).lower())
     render_order = [
@@ -343,7 +384,8 @@ def plot_part1_detailed_base(ax: Any, G: nx.MultiDiGraph, title: str, show_title
                     zorder=zorder + 0.1, capstyle="round", joinstyle="round")
 
     if show_title:
-        ax.set_title(title, fontsize=13, fontweight="bold", loc="left", pad=10, color="#111827")
+        ax.set_title(title, fontsize=13, fontweight="bold", loc="left", pad=10,
+                     color="#111827")
     ax.set_axis_off()
 
 
@@ -353,7 +395,9 @@ def make_base_folium_map(G: nx.MultiDiGraph, name: str) -> Any:
 
     nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
     center = [float(nodes_gdf.geometry.y.mean()), float(nodes_gdf.geometry.x.mean())]
-    fmap = folium.Map(location=center, zoom_start=14, tiles="cartodbpositron", control_scale=True)
+    fmap = folium.Map(
+        location=center, zoom_start=14, tiles="cartodbpositron", control_scale=True
+    )
 
     for layer_name, file_name, stroke, fill, opacity in [
         ("Parks",     "dong_da_parks.geojson",     "#7cb342", "#c8e6c9", 0.45),
@@ -375,11 +419,11 @@ def make_base_folium_map(G: nx.MultiDiGraph, name: str) -> Any:
             pass
 
     road_style = {
-        "motorway":     ("#f39c12", 4), "trunk":        ("#f39c12", 4),
-        "primary":      ("#f59e0b", 4), "secondary":    ("#ffffff", 3),
-        "tertiary":     ("#ffffff", 2), "residential":  ("#ffffff", 2),
-        "service":      ("#d1d5db", 1), "living_street":("#d1d5db", 1),
-        "unclassified": ("#d1d5db", 1), "road":         ("#ffffff", 2),
+        "motorway":      ("#f39c12", 4), "trunk":         ("#f39c12", 4),
+        "primary":       ("#f59e0b", 4), "secondary":     ("#ffffff", 3),
+        "tertiary":      ("#ffffff", 2), "residential":   ("#ffffff", 2),
+        "service":       ("#d1d5db", 1), "living_street": ("#d1d5db", 1),
+        "unclassified":  ("#d1d5db", 1), "road":          ("#ffffff", 2),
     }
     road_group = folium.FeatureGroup(name="Road graph", show=True)
     for _, row in edges_gdf.iterrows():
@@ -411,6 +455,17 @@ def save_folium_map(fmap: Any, filename: str) -> None:
     print(f"  Interactive map: {path}")
 
 
+def prune_path_cache(
+    cache: dict[tuple[int, int], list], valid_nodes: set
+) -> dict[tuple[int, int], list]:
+    """Remove cached paths whose endpoints are no longer in the filtered graph."""
+    pruned = {}
+    for (src_idx, dst_idx), path in cache.items():
+        if path and str(path[0]) in valid_nodes and str(path[-1]) in valid_nodes:
+            pruned[(src_idx, dst_idx)] = path
+    return pruned
+
+
 def part2_shortest_routes(G: nx.MultiDiGraph) -> dict[str, Any]:
     print("\n" + "=" * 70)
     print("PART 2 — SHORTEST ROUTE CALCULATION (OPTIMIZED)")
@@ -426,8 +481,12 @@ def part2_shortest_routes(G: nx.MultiDiGraph) -> dict[str, Any]:
 
     print(f"Depots: {N_DEPOTS} | Deliveries: {N_DELIVERIES} | Workers: {N_WORKERS}")
 
-    time_matrix, time_path_cache = build_matrix_parallel(all_points, "weight_time",     "time_matrix")
-    dist_matrix, dist_path_cache = build_matrix_parallel(all_points, "weight_distance", "dist_matrix")
+    time_matrix, time_path_cache = build_matrix_parallel(
+        all_points, "weight_time", "time_matrix"
+    )
+    dist_matrix, dist_path_cache = build_matrix_parallel(
+        all_points, "weight_distance", "dist_matrix"
+    )
 
     np.save(OUTPUT_DIR / "time_matrix.npy", time_matrix)
     np.save(OUTPUT_DIR / "dist_matrix.npy", dist_matrix)
@@ -436,6 +495,12 @@ def part2_shortest_routes(G: nx.MultiDiGraph) -> dict[str, Any]:
         pickle.dump(time_path_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
     with open(OUTPUT_DIR / "dist_path_cache.pkl", "wb") as f:
         pickle.dump(dist_path_cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    # ── FIX: prune stale nodes from path cache after graph filtering ──────────
+    valid_nodes = set(G.nodes())
+    time_path_cache = prune_path_cache(time_path_cache, valid_nodes)
+    dist_path_cache = prune_path_cache(dist_path_cache, valid_nodes)
+    # ─────────────────────────────────────────────────────────────────────────
 
     depot_assignment = assign_depots_balanced(
         metadata["depots"], metadata["deliveries"], time_matrix
@@ -452,23 +517,27 @@ def part2_shortest_routes(G: nx.MultiDiGraph) -> dict[str, Any]:
             arrival = float(WORKING_START_HOUR * 60) + float(
                 time_matrix[depot["matrix_index"], delivery["matrix_index"]]
             )
-            if tw_penalty_score(arrival, delivery["time_window"][0], delivery["time_window"][1]) > 0:
+            if tw_penalty_score(
+                arrival, delivery["time_window"][0], delivery["time_window"][1]
+            ) > 0:
                 tw_violations += 1
 
     summary = {
-        "n_points":          len(all_points),
-        "reachable_pairs":   int(finite.sum()),
-        "total_pairs":       int(time_matrix.size),
-        "reachable_pct":     round(float(finite.mean() * 100), 2),
-        "mean_time_min":     round(float(time_matrix[(time_matrix > 0) & finite].mean()), 2),
-        "n_workers":         N_WORKERS,
-        "path_cache_entries":len(time_path_cache),
-        "tw_violations":     tw_violations,
-        "tw_compliance_pct": round((1 - tw_violations / N_DELIVERIES) * 100, 2),
+        "n_points":           len(all_points),
+        "reachable_pairs":    int(finite.sum()),
+        "total_pairs":        int(time_matrix.size),
+        "reachable_pct":      round(float(finite.mean() * 100), 2),
+        "mean_time_min":      round(float(time_matrix[(time_matrix > 0) & finite].mean()), 2),
+        "n_workers":          N_WORKERS,
+        "path_cache_entries": len(time_path_cache),
+        "tw_violations":      tw_violations,
+        "tw_compliance_pct":  round((1 - tw_violations / N_DELIVERIES) * 100, 2),
     }
     save_json(OUTPUT_DIR / "part2_summary.json", summary)
 
-    visualize_part2_shortest_routes(G, metadata, depot_assignment, time_path_cache, time_matrix)
+    visualize_part2_shortest_routes(
+        G, metadata, depot_assignment, time_path_cache, time_matrix
+    )
 
     print(f"\nReachable pairs : {summary['reachable_pct']}%")
     print(f"TW compliance   : {summary['tw_compliance_pct']}%")
@@ -500,7 +569,9 @@ def visualize_part2_shortest_routes(
                 delivery_by_depot[depot["name"]].append((depot, delivery, route_nodes))
 
     fig, ax = plt.subplots(figsize=(14, 14), dpi=180, facecolor="#f4efe7")
-    plot_part1_detailed_base(ax, G, "Part 2 — Shortest Routes (Balanced Depot Assignment)")
+    plot_part1_detailed_base(
+        ax, G, "Part 2 — Shortest Routes (Balanced Depot Assignment)"
+    )
 
     for depot_idx, depot in enumerate(depots):
         color = MAP_COLORS[depot_idx % len(MAP_COLORS)]
@@ -514,14 +585,17 @@ def visualize_part2_shortest_routes(
         n_assigned = len(delivery_by_depot.get(depot["name"], []))
         ax.scatter(depot["lon"], depot["lat"], s=130, marker="s",
                    color=color, edgecolor="white", zorder=31)
-        ax.text(depot["lon"], depot["lat"],
-                f"{depot['name']} ({n_assigned})",
-                fontsize=8, color="#111827", zorder=32)
+        ax.text(
+            depot["lon"], depot["lat"],
+            f"{depot['name']} ({n_assigned})",
+            fontsize=8, color="#111827", zorder=32,
+        )
 
     ax.scatter(
         [d["lon"] for d in deliveries],
         [d["lat"] for d in deliveries],
-        s=18, color="#f97316", edgecolor="white", linewidth=0.3, alpha=0.9, zorder=30,
+        s=18, color="#f97316", edgecolor="white",
+        linewidth=0.3, alpha=0.9, zorder=30,
     )
 
     out_path = OUTPUT_DIR / "part2_shortest_routes.png"
@@ -549,7 +623,10 @@ def visualize_part2_shortest_routes(
                     tw_tag = "on time" if pen == 0 else f"penalty={pen:.0f}m"
                     folium.PolyLine(
                         latlons, color=color, weight=2, opacity=0.45,
-                        tooltip=f"{depot['name']} → {delivery['order_id']} | TW: {tw_tag}",
+                        tooltip=(
+                            f"{depot['name']} → {delivery['order_id']}"
+                            f" | TW: {tw_tag}"
+                        ),
                     ).add_to(group)
                 folium.CircleMarker(
                     [delivery["lat"], delivery["lon"]],
