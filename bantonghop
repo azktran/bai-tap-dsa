@@ -3082,7 +3082,497 @@ def parse_departure_minutes(value: str) -> float:
     return (int(hour) - WORKING_START_HOUR) * 60 + int(minute)
 
 
-def part5_simulation_dashboard() -> dict[str, Any]:
+def matrix_point_latlon(delivery_data: dict[str, Any], matrix_idx: int) -> tuple[float, float]:
+    if matrix_idx < N_DEPOTS:
+        point = delivery_data["depots"][matrix_idx]
+    else:
+        point = delivery_data["deliveries"][matrix_index_to_order_idx(matrix_idx)]
+    return float(point["lat"]), float(point["lon"])
+
+
+def matrix_leg_animation_path(
+    G: nx.MultiDiGraph | None,
+    delivery_data: dict[str, Any],
+    src_idx: int,
+    dst_idx: int,
+) -> list[list[float]]:
+    if G is not None:
+        graph_route = matrix_route_to_graph_route(G, [src_idx, dst_idx])
+        latlon = route_latlon_path(G, graph_route) if graph_route else []
+        if len(latlon) >= 2:
+            return [[float(lat), float(lon)] for lat, lon in latlon]
+
+    src = matrix_point_latlon(delivery_data, src_idx)
+    dst = matrix_point_latlon(delivery_data, dst_idx)
+    return [[src[0], src[1]], [dst[0], dst[1]]]
+
+
+def build_delivery_animation_segments(
+    G: nx.MultiDiGraph | None,
+    solution: dict[str, Any],
+    delivery_data: dict[str, Any],
+    time_matrix: np.ndarray,
+) -> list[dict[str, Any]]:
+    segments = []
+    sequence = 0
+
+    for route in solution["schedule"]:
+        shipper_id = int(route["shipper_id"])
+        path = [int(idx) for idx in route["route_stops"]]
+        current_time = parse_departure_minutes(route["departure"])
+
+        for src_idx, dst_idx in zip(path[:-1], path[1:]):
+            travel = max(float(time_matrix[src_idx, dst_idx]), 0.01)
+            start_time = current_time
+            end_time = current_time + travel
+
+            if dst_idx >= N_DEPOTS:
+                target = delivery_data["deliveries"][matrix_index_to_order_idx(dst_idx)]["order_id"]
+                status = f"Driving to {target}"
+            else:
+                target = route["depot_name"]
+                status = "Returning to depot"
+
+            segments.append(
+                {
+                    "sequence": sequence,
+                    "shipper_id": shipper_id,
+                    "start_min": round(start_time, 3),
+                    "end_min": round(end_time, 3),
+                    "type": "DRIVE",
+                    "label": status,
+                    "path": matrix_leg_animation_path(G, delivery_data, src_idx, dst_idx),
+                }
+            )
+            sequence += 1
+            current_time = end_time
+
+            if dst_idx >= N_DEPOTS:
+                lat, lon = matrix_point_latlon(delivery_data, dst_idx)
+                order_id = delivery_data["deliveries"][matrix_index_to_order_idx(dst_idx)]["order_id"]
+                segments.append(
+                    {
+                        "sequence": sequence,
+                        "shipper_id": shipper_id,
+                        "start_min": round(current_time, 3),
+                        "end_min": round(current_time + SERVICE_TIME_MIN, 3),
+                        "type": "SERVICE",
+                        "label": f"Delivering {order_id}",
+                        "path": [[lat, lon], [lat, lon]],
+                    }
+                )
+                sequence += 1
+                current_time += SERVICE_TIME_MIN
+
+    return segments
+
+
+def save_delivery_animation_html(
+    G: nx.MultiDiGraph | None,
+    solution: dict[str, Any],
+    delivery_data: dict[str, Any],
+    time_matrix: np.ndarray,
+) -> None:
+    print("\n[VIS] Part 5 delivery animation...")
+    segments = build_delivery_animation_segments(G, solution, delivery_data, time_matrix)
+    if not segments:
+        print("  Skipped animation: no route segments")
+        return
+
+    all_points = [point for segment in segments for point in segment["path"]]
+    center_lat = float(np.mean([point[0] for point in all_points]))
+    center_lon = float(np.mean([point[1] for point in all_points]))
+    min_time = min(segment["start_min"] for segment in segments)
+    max_time = max(segment["end_min"] for segment in segments)
+    colors = {idx: MAP_COLORS[idx % len(MAP_COLORS)] for idx in range(N_SHIPPERS)}
+
+    def read_geojson(filename: str) -> dict[str, Any] | None:
+        path = OUTPUT_DIR / filename
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+
+    local_layers = {
+        "edges": read_geojson("dong_da_edges.geojson"),
+        "buildings": read_geojson("dong_da_buildings.geojson"),
+        "parks": read_geojson("dong_da_parks.geojson"),
+        "water": read_geojson("dong_da_water.geojson"),
+    }
+
+    animation_path = OUTPUT_DIR / "part5_delivery_animation.html"
+    payload = json.dumps(
+        {
+            "center": [center_lat, center_lon],
+            "segments": segments,
+            "colors": colors,
+            "minTime": min_time,
+            "maxTime": max_time,
+            "workingStartHour": WORKING_START_HOUR,
+            "layers": local_layers,
+        },
+        ensure_ascii=False,
+    )
+
+    html = f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Dong Da Delivery Animation</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html, body {{ height: 100%; margin: 0; font-family: Arial, sans-serif; }}
+    #map {{ height: 100%; width: 100%; background: #f4efe7; }}
+    .panel {{
+      position: absolute; left: 16px; right: 16px; bottom: 16px; z-index: 1000;
+      background: rgba(255,255,255,0.96); border: 1px solid #d1d5db;
+      border-radius: 8px; padding: 12px 14px; box-shadow: 0 6px 24px rgba(0,0,0,0.14);
+    }}
+    .topbar {{ display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }}
+    button {{
+      border: 0; background: #111827; color: white; padding: 8px 13px;
+      border-radius: 6px; cursor: pointer; font-weight: 700;
+    }}
+    button.secondary {{ background: #4b5563; }}
+    #clock {{ font-size: 24px; font-weight: 800; min-width: 86px; }}
+    #status {{ color: #374151; font-size: 14px; flex: 1; }}
+    input[type=range] {{ width: 100%; }}
+    .shipper-icon {{
+      width: 24px; height: 24px; border-radius: 50%; color: white;
+      border: 2px solid white; display: flex; align-items: center; justify-content: center;
+      font-size: 11px; font-weight: 800; box-shadow: 0 2px 8px rgba(0,0,0,0.28);
+    }}
+    .legend {{
+      position: absolute; right: 16px; top: 16px; z-index: 1000;
+      background: rgba(255,255,255,0.94); border: 1px solid #d1d5db;
+      border-radius: 8px; padding: 10px 12px; font-size: 13px;
+    }}
+    .legend-row {{ display: flex; align-items: center; gap: 7px; margin: 5px 0; }}
+    .swatch {{ width: 12px; height: 12px; border-radius: 50%; display: inline-block; }}
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="legend" id="legend"></div>
+  <div class="panel">
+    <div class="topbar">
+      <button id="playBtn">Play</button>
+      <button id="resetBtn" class="secondary">Reset</button>
+      <div id="clock">08:00</div>
+      <div id="status">Ready</div>
+    </div>
+    <input id="timeline" type="range" min="{min_time}" max="{max_time}" step="0.1" value="{min_time}">
+  </div>
+  <script>
+    const data = {payload};
+    const map = L.map('map', {{
+      zoomControl: true,
+      preferCanvas: true
+    }}).setView(data.center, 14);
+    map.attributionControl.setPrefix('');
+    map.attributionControl.addAttribution('Local OSMnx graph layers from dong_da_output');
+
+    map.createPane('areas');
+    map.createPane('buildings');
+    map.createPane('roads');
+    map.createPane('routes');
+    map.createPane('trails');
+    map.createPane('markers');
+    map.getPane('areas').style.zIndex = 200;
+    map.getPane('buildings').style.zIndex = 250;
+    map.getPane('roads').style.zIndex = 300;
+    map.getPane('routes').style.zIndex = 430;
+    map.getPane('trails').style.zIndex = 500;
+    map.getPane('markers').style.zIndex = 650;
+
+    const timeline = document.getElementById('timeline');
+    const playBtn = document.getElementById('playBtn');
+    const resetBtn = document.getElementById('resetBtn');
+    const clock = document.getElementById('clock');
+    const status = document.getElementById('status');
+    const speedMinutesPerSecond = 8;
+    let current = Number(data.minTime);
+    let playing = false;
+    let lastFrame = null;
+    let activeLabels = {{}};
+
+    function roadStyle(feature) {{
+      const highway = String(feature.properties?.highway || 'road').toLowerCase();
+      const styles = {{
+        motorway: ['#e67e22', 3.2, 0.8],
+        trunk: ['#e67e22', 3.0, 0.8],
+        primary: ['#d97706', 2.6, 0.75],
+        secondary: ['#9ca3af', 2.0, 0.7],
+        tertiary: ['#a3a3a3', 1.5, 0.65],
+        residential: ['#bdbdbd', 1.1, 0.62],
+        service: ['#d1d5db', 0.8, 0.55],
+        living_street: ['#d1d5db', 0.8, 0.55],
+        unclassified: ['#d1d5db', 0.8, 0.55],
+        road: ['#bdbdbd', 1.0, 0.6]
+      }};
+      const style = styles[highway] || ['#c9c9c9', 0.7, 0.5];
+      return {{ color: style[0], weight: style[1], opacity: style[2], pane: 'roads' }};
+    }}
+
+    function addLocalLayer(layer, style, paneName) {{
+      if (!layer) return null;
+      return L.geoJSON(layer, {{
+        pane: paneName,
+        style: style,
+        interactive: false
+      }}).addTo(map);
+    }}
+
+    addLocalLayer(data.layers?.parks, {{
+      color: '#a5d6a7',
+      weight: 0.4,
+      fillColor: '#c8e6c9',
+      fillOpacity: 0.8,
+      pane: 'areas'
+    }}, 'areas');
+    addLocalLayer(data.layers?.water, {{
+      color: '#90c4e8',
+      weight: 0.5,
+      fillColor: '#b3d9ff',
+      fillOpacity: 0.86,
+      pane: 'areas'
+    }}, 'areas');
+    addLocalLayer(data.layers?.buildings, {{
+      color: '#bdb5ad',
+      weight: 0.12,
+      fillColor: '#d6cfc8',
+      fillOpacity: 0.72,
+      pane: 'buildings'
+    }}, 'buildings');
+    addLocalLayer(data.layers?.edges, roadStyle, 'roads');
+
+    const routeBounds = L.latLngBounds(data.segments.flatMap(segment => segment.path));
+    if (routeBounds.isValid()) map.fitBounds(routeBounds.pad(0.18));
+
+    const byShipper = new Map();
+    const trails = new Map();
+    data.segments.forEach(segment => {{
+      if (!byShipper.has(segment.shipper_id)) byShipper.set(segment.shipper_id, []);
+      byShipper.get(segment.shipper_id).push(segment);
+      L.polyline(segment.path, {{
+        color: data.colors[segment.shipper_id],
+        weight: segment.type === 'SERVICE' ? 2 : 3,
+        opacity: segment.type === 'SERVICE' ? 0.08 : 0.2,
+        pane: 'routes',
+        dashArray: segment.type === 'SERVICE' ? '3 6' : null
+      }}).addTo(map);
+    }});
+
+    const markers = new Map();
+    for (const [shipperId, segments] of byShipper.entries()) {{
+      segments.sort((a, b) => a.start_min - b.start_min || a.sequence - b.sequence);
+      const start = segments[0].path[0];
+      const color = data.colors[shipperId];
+      const marker = L.marker(start, {{
+        icon: L.divIcon({{
+          className: '',
+          html: `<div class="shipper-icon" style="background:${{color}}">S${{shipperId}}</div>`,
+          iconSize: [28, 28],
+          iconAnchor: [14, 14]
+        }})
+      }}).addTo(map);
+      marker.bindTooltip(`Shipper ${{shipperId}}`, {{ permanent: false }});
+      markers.set(shipperId, marker);
+
+      const color = data.colors[shipperId];
+      const glow = L.polyline([], {{
+        color,
+        weight: 10,
+        opacity: 0.35,
+        pane: 'trails',
+        lineCap: 'round',
+        lineJoin: 'round'
+      }}).addTo(map);
+      const core = L.polyline([], {{
+        color,
+        weight: 4,
+        opacity: 0.98,
+        pane: 'trails',
+        lineCap: 'round',
+        lineJoin: 'round'
+      }}).addTo(map);
+      trails.set(shipperId, {{ glow, core }});
+    }}
+
+    const legend = document.getElementById('legend');
+    legend.innerHTML = '<b>Shippers</b>' + Array.from(byShipper.keys()).sort((a,b)=>a-b).map(id =>
+      `<div class="legend-row"><span class="swatch" style="background:${{data.colors[id]}}"></span>S${{id}}</div>`
+    ).join('');
+
+    function clockText(minutesFromStart) {{
+      const total = data.workingStartHour * 60 + Math.round(minutesFromStart);
+      const h = Math.floor(total / 60) % 24;
+      const m = total % 60;
+      return `${{String(h).padStart(2, '0')}}:${{String(m).padStart(2, '0')}}`;
+    }}
+
+    function interpolate(path, ratio) {{
+      if (path.length === 1) return path[0];
+      ratio = Math.max(0, Math.min(1, ratio));
+      const distances = [];
+      let total = 0;
+      for (let i = 0; i < path.length - 1; i++) {{
+        const a = path[i], b = path[i + 1];
+        const d = Math.hypot(b[0] - a[0], b[1] - a[1]);
+        distances.push(d);
+        total += d;
+      }}
+      if (total === 0) return path[path.length - 1];
+      let target = total * ratio;
+      for (let i = 0; i < distances.length; i++) {{
+        if (target <= distances[i]) {{
+          const local = distances[i] === 0 ? 0 : target / distances[i];
+          const a = path[i], b = path[i + 1];
+          return [a[0] + (b[0] - a[0]) * local, a[1] + (b[1] - a[1]) * local];
+        }}
+        target -= distances[i];
+      }}
+      return path[path.length - 1];
+    }}
+
+    function pathPrefix(path, ratio) {{
+      if (path.length <= 1) return path.slice();
+      ratio = Math.max(0, Math.min(1, ratio));
+      const distances = [];
+      let total = 0;
+      for (let i = 0; i < path.length - 1; i++) {{
+        const a = path[i], b = path[i + 1];
+        const d = Math.hypot(b[0] - a[0], b[1] - a[1]);
+        distances.push(d);
+        total += d;
+      }}
+      if (total === 0) return [path[0], path[path.length - 1]];
+
+      let target = total * ratio;
+      const result = [path[0]];
+      for (let i = 0; i < distances.length; i++) {{
+        const a = path[i], b = path[i + 1];
+        if (target >= distances[i]) {{
+          result.push(b);
+          target -= distances[i];
+          continue;
+        }}
+        const local = distances[i] === 0 ? 0 : target / distances[i];
+        result.push([a[0] + (b[0] - a[0]) * local, a[1] + (b[1] - a[1]) * local]);
+        break;
+      }}
+      return result;
+    }}
+
+    function travelledPath(segments, t) {{
+      const points = [];
+      for (const segment of segments) {{
+        if (segment.type !== 'DRIVE') continue;
+        if (t < segment.start_min) break;
+
+        let addPath;
+        if (t >= segment.end_min) {{
+          addPath = segment.path;
+        }} else {{
+          const ratio = segment.end_min === segment.start_min
+            ? 1
+            : (t - segment.start_min) / (segment.end_min - segment.start_min);
+          addPath = pathPrefix(segment.path, ratio);
+        }}
+
+        if (points.length && addPath.length) addPath = addPath.slice(1);
+        points.push(...addPath);
+        if (t < segment.end_min) break;
+      }}
+      return points;
+    }}
+
+    function update(t) {{
+      current = Math.max(Number(data.minTime), Math.min(Number(data.maxTime), t));
+      timeline.value = current;
+      clock.textContent = clockText(current);
+      activeLabels = {{}};
+
+      for (const [shipperId, segments] of byShipper.entries()) {{
+        let chosen = segments[0];
+        for (const segment of segments) {{
+          if (current >= segment.start_min && current <= segment.end_min) {{
+            chosen = segment;
+            break;
+          }}
+          if (current > segment.end_min) chosen = segment;
+        }}
+
+        const ratio = chosen.end_min === chosen.start_min
+          ? 1
+          : (current - chosen.start_min) / (chosen.end_min - chosen.start_min);
+        const pos = interpolate(chosen.path, ratio);
+        markers.get(shipperId).setLatLng(pos);
+        const trail = travelledPath(segments, current);
+        const trailLayers = trails.get(shipperId);
+        trailLayers.glow.setLatLngs(trail);
+        trailLayers.core.setLatLngs(trail);
+        activeLabels[shipperId] = chosen.label;
+      }}
+
+      const labels = Object.entries(activeLabels)
+        .map(([id, label]) => `S${{id}}: ${{label}}`)
+        .slice(0, 4)
+        .join(' | ');
+      status.textContent = labels || 'Completed';
+    }}
+
+    function frame(ts) {{
+      if (!playing) return;
+      if (lastFrame === null) lastFrame = ts;
+      const elapsedSeconds = (ts - lastFrame) / 1000;
+      lastFrame = ts;
+      update(current + elapsedSeconds * speedMinutesPerSecond);
+      if (current >= Number(data.maxTime)) {{
+        playing = false;
+        playBtn.textContent = 'Play';
+        lastFrame = null;
+        return;
+      }}
+      requestAnimationFrame(frame);
+    }}
+
+    playBtn.addEventListener('click', () => {{
+      playing = !playing;
+      playBtn.textContent = playing ? 'Pause' : 'Play';
+      lastFrame = null;
+      if (playing) requestAnimationFrame(frame);
+    }});
+
+    resetBtn.addEventListener('click', () => {{
+      playing = false;
+      playBtn.textContent = 'Play';
+      lastFrame = null;
+      update(Number(data.minTime));
+    }});
+
+    timeline.addEventListener('input', () => {{
+      playing = false;
+      playBtn.textContent = 'Play';
+      lastFrame = null;
+      update(Number(timeline.value));
+    }});
+
+    update(Number(data.minTime));
+  </script>
+</body>
+</html>
+"""
+    animation_path.write_text(html, encoding="utf-8")
+    print(f"  Delivery animation HTML: {animation_path}")
+
+
+def part5_simulation_dashboard(G: nx.MultiDiGraph | None = None) -> dict[str, Any]:
     print("\n" + "=" * 70)
     print("PART 5 — SIMULATION & DASHBOARD")
     print("=" * 70)
@@ -3161,6 +3651,7 @@ def part5_simulation_dashboard() -> dict[str, Any]:
 
     save_json(OUTPUT_DIR / "simulation_events.json", events)
     save_json(OUTPUT_DIR / "simulation_summary.json", summary)
+    save_delivery_animation_html(G, solution, delivery_data, time_matrix)
     save_dashboard_html(solution, summary, events)
     print(f"Saved simulation with {len(events)} events")
     return summary
@@ -3220,6 +3711,14 @@ def save_dashboard_html(solution: dict[str, Any], summary: dict[str, Any], event
         except Exception:
             dsa_section = ""
 
+    animation_file = OUTPUT_DIR / "part5_delivery_animation.html"
+    if animation_file.exists():
+        map_heading = "Delivery Animation"
+        map_iframe = "part5_delivery_animation.html"
+    else:
+        map_heading = "Interactive Map"
+        map_iframe = "part4_vrp_routes.html"
+
     html = f"""
 <!doctype html>
 <html lang="en">
@@ -3254,8 +3753,8 @@ def save_dashboard_html(solution: dict[str, Any], summary: dict[str, Any], event
       <div class="card">Distance<div class="metric">{summary['total_distance_km']} km</div></div>
     </section>
 
-    <h2>Interactive Map</h2>
-    <iframe src="part4_vrp_routes.html"></iframe>
+    <h2>{map_heading}</h2>
+    <iframe src="{map_iframe}"></iframe>
 
     {dsa_section}
 
@@ -3310,7 +3809,7 @@ def main() -> None:
     zone_summary = part3_zone_division(G)
     solution = part4_vrp_optimization(G)
     run_dsa_upgrade_evaluation(G, delivery_data, solution)
-    part5_simulation_dashboard()
+    part5_simulation_dashboard(G)
     create_presentation_visuals(G, delivery_data, zone_summary, solution)
 
     print("\n" + "=" * 70)
