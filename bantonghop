@@ -1,0 +1,3324 @@
+"""
+=============================================================================
+CITY LOGISTICS & ROUTING SYSTEM — PART 1 OPTIMIZED
+=============================================================================
+Area    : Dong Da District, Hanoi, Vietnam
+Goal    : Build a practical routing graph for shortest path, VRP, shipper
+          allocation, congestion simulation, and logistics optimization.
+
+Key improvements vs the original Part 1:
+  - Uses simplify=True for routing performance while preserving edge geometry.
+  - Filters roads that are unsuitable for motorcycle/vehicle logistics.
+  - Keeps the largest weakly connected component to reduce unreachable pairs.
+  - Separates routing graph concerns from GIS rendering/export.
+  - Normalizes OSM attributes and numeric edge weights before saving.
+  - Exports compact GeoJSON with only useful routing attributes.
+=============================================================================
+"""
+
+from __future__ import annotations
+
+import os
+import time
+import warnings
+from pathlib import Path
+from typing import Any
+from shapely.geometry import MultiPoint
+
+
+import geopandas as gpd
+import matplotlib.pyplot as plt
+import networkx as nx
+import osmnx as ox
+import pandas as pd
+
+try:
+    import folium
+except ImportError:
+    folium = None
+
+warnings.filterwarnings(
+    "ignore",
+    category=FutureWarning,
+)
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+PLACE = "Đống Đa, Hà Nội, Việt Nam"
+OUTPUT_DIR = Path("./dong_da_output")
+CACHE_DIR = Path("./osm_cache")
+
+OUTPUT_DIR.mkdir(exist_ok=True)
+CACHE_DIR.mkdir(exist_ok=True)
+
+ox.settings.log_console = True
+ox.settings.use_cache = True
+ox.settings.cache_folder = str(CACHE_DIR)
+ox.settings.timeout = 300
+
+
+# Speeds are tuned for inner-city Hanoi motorcycle/logistics routing.
+# Unit: km/h.
+HEURISTIC_SPEEDS = {
+    "motorway": 70,
+    "trunk": 55,
+    "primary": 40,
+    "secondary": 32,
+    "tertiary": 26,
+    "residential": 22,
+    "service": 14,
+    "unclassified": 18,
+    "living_street": 10,
+    "road": 20,
+}
+
+# Roads that should not be used for vehicle/motorcycle logistics.
+BLOCKED_HIGHWAYS = {
+    "footway",
+    "steps",
+    "pedestrian",
+    "cycleway",
+    "bridleway",
+    "corridor",
+    "elevator",
+    "escalator",
+    "platform",
+    "proposed",
+    "construction",
+}
+
+NO_ACCESS_VALUES = {"no", "private", "customers", "permit"}
+
+EXPORT_EDGE_COLUMNS = [
+    "u",
+    "v",
+    "key",
+    "geometry",
+    "osmid",
+    "highway",
+    "name",
+    "length",
+    "oneway",
+    "lanes",
+    "maxspeed",
+    "speed_kph",
+    "travel_time",
+    "weight_distance",
+    "weight_time",
+    "weight_congestion",
+    "weight_logistics",
+    "congestion_factor",
+    "capacity",
+]
+
+STATIC_ROAD_STYLE = {
+    "motorway": ("#e67e22", "#f39c12", 3.2, 2.0, 9, 1.0),
+    "trunk": ("#e67e22", "#f39c12", 3.0, 1.9, 9, 1.0),
+    "primary": ("#d97706", "#fbbf24", 2.6, 1.6, 8, 1.0),
+    "secondary": ("#9ca3af", "#ffffff", 2.0, 1.2, 7, 1.0),
+    "tertiary": ("#9ca3af", "#ffffff", 1.5, 0.9, 6, 0.95),
+    "residential": ("#a3a3a3", "#ffffff", 1.1, 0.7, 5, 0.9),
+    "service": ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
+    "living_street": ("#bdbdbd", "#f3f4f6", 0.8, 0.45, 4, 0.82),
+    "unclassified": ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
+    "road": ("#a3a3a3", "#ffffff", 1.0, 0.65, 5, 0.9),
+    "_default": ("#bdbdbd", "#dddddd", 0.7, 0.4, 3, 0.75),
+}
+
+INTERACTIVE_ROAD_STYLE = {
+    "motorway": ("#e67e22", 5),
+    "trunk": ("#e67e22", 5),
+    "primary": ("#f59e0b", 4),
+    "secondary": ("#facc15", 3),
+    "tertiary": ("#2563eb", 3),
+    "residential": ("#6b7280", 2),
+    "service": ("#9ca3af", 2),
+    "living_street": ("#9ca3af", 2),
+    "unclassified": ("#9ca3af", 2),
+    "road": ("#6b7280", 2),
+}
+
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+def first_value(value: Any, default: Any = None) -> Any:
+    """Return the first scalar value from common OSM list-like attributes."""
+    if isinstance(value, (list, tuple, set)):
+        return next(iter(value), default)
+    return value if value is not None else default
+
+
+def to_float(value: Any, default: float) -> float:
+    """Convert OSM string/list values to float safely."""
+    value = first_value(value, default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def to_int(value: Any, default: int) -> int:
+    """Convert OSM string/list values to int safely."""
+    value = first_value(value, default)
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_highway(value: Any) -> str:
+    """Normalize an OSM highway attribute to a single lowercase string."""
+    value = first_value(value, "unclassified")
+    return str(value).lower() if value is not None else "unclassified"
+
+
+def is_blocked_for_logistics(edge_data: dict[str, Any]) -> bool:
+    """
+    Decide whether an OSM edge is unsuitable for logistics routing.
+
+    This is conservative: it removes explicit pedestrian/cycle-only facilities
+    and edges with clear vehicle or motorcycle access restrictions.
+    """
+    highway = normalize_highway(edge_data.get("highway"))
+    if highway in BLOCKED_HIGHWAYS:
+        return True
+
+    access = str(first_value(edge_data.get("access"), "")).lower()
+    vehicle = str(first_value(edge_data.get("vehicle"), "")).lower()
+    motor_vehicle = str(first_value(edge_data.get("motor_vehicle"), "")).lower()
+    motorcycle = str(first_value(edge_data.get("motorcycle"), "")).lower()
+
+    if access in NO_ACCESS_VALUES:
+        return True
+    if vehicle == "no" or motor_vehicle == "no" or motorcycle == "no":
+        return True
+
+    return False
+
+
+def keep_largest_component(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Keep the largest weakly connected component for directed road graphs."""
+    if G.number_of_nodes() == 0:
+        return G
+    if nx.is_weakly_connected(G):
+        return G
+
+    largest = max(nx.weakly_connected_components(G), key=len)
+    return G.subgraph(largest).copy()
+
+
+def clean_object_columns(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Make GeoJSON export robust by converting unsupported object values.
+
+    Geometry is left untouched. Lists/dicts are stringified; normal scalar values
+    are kept as-is where possible.
+    """
+    cleaned = gdf.copy()
+    for col in cleaned.columns:
+        if col == cleaned.geometry.name:
+            continue
+        if cleaned[col].dtype == object:
+            cleaned[col] = cleaned[col].map(
+                lambda x: ", ".join(map(str, x))
+                if isinstance(x, (list, tuple, set))
+                else str(x)
+                if isinstance(x, dict)
+                else x
+            )
+    return cleaned
+
+
+def display_value(value: Any, default: str = "Unnamed road") -> str:
+    """Convert OSM scalar/list values to a readable string for map labels."""
+    if value is None:
+        return default
+    if isinstance(value, float) and pd.isna(value):
+        return default
+    if isinstance(value, (list, tuple, set)):
+        values = [str(item) for item in value if item is not None and not pd.isna(item)]
+        return ", ".join(values) if values else default
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return default
+    return text
+
+
+def add_logistics_weights(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    """Add routing weights needed by later shortest path and VRP stages."""
+    G = ox.add_edge_speeds(G, hwy_speeds=HEURISTIC_SPEEDS)
+    G = ox.add_edge_travel_times(G)
+
+    congestion_by_highway = {
+        "motorway": 1.15,
+        "trunk": 1.30,
+        "primary": 1.75,
+        "secondary": 1.55,
+        "tertiary": 1.30,
+        "residential": 1.12,
+        "service": 1.05,
+        "living_street": 1.05,
+        "unclassified": 1.12,
+        "road": 1.15,
+    }
+
+    fuel_cost_per_km = 2000.0
+    time_value_per_min = 500.0
+
+    for _, _, _, data in G.edges(keys=True, data=True):
+        highway = normalize_highway(data.get("highway"))
+        length_m = to_float(data.get("length"), 50.0)
+        speed_kph = to_float(data.get("speed_kph"), HEURISTIC_SPEEDS.get(highway, 20))
+        travel_time_s = to_float(data.get("travel_time"), length_m / max(speed_kph, 1) * 3.6)
+        lanes = max(to_int(data.get("lanes"), 1), 1)
+
+        congestion = congestion_by_highway.get(highway, 1.12)
+        distance_km = length_m / 1000.0
+        time_min = travel_time_s / 60.0
+
+        data["highway"] = highway
+        data["length"] = length_m
+        data["speed_kph"] = speed_kph
+        data["travel_time"] = travel_time_s
+        data["lanes"] = lanes
+        data["weight_distance"] = distance_km
+        data["weight_time"] = time_min
+        data["congestion_factor"] = congestion
+        data["weight_congestion"] = time_min * congestion
+        data["weight_logistics"] = (
+            time_min * time_value_per_min * congestion
+            + distance_km * fuel_cost_per_km
+        )
+        data["capacity"] = lanes * speed_kph
+
+    return G
+
+
+def build_routing_graph() -> nx.MultiDiGraph:
+    """
+    Download and prepare a practical logistics routing graph.
+
+    simplify=True is intentional: OSMnx preserves road geometry on simplified
+    edges, but the graph has far fewer routing states than simplify=False.
+    """
+    print("\n[1/5] Downloading routing graph...")
+    print(f"      Place: {PLACE}")
+    print("      network_type=all, simplify=True, retain_all=False")
+
+    start = time.time()
+    G = ox.graph_from_place(
+        PLACE,
+        network_type="all",
+        simplify=True,
+        retain_all=False,
+        truncate_by_edge=True,
+    )
+
+    raw_nodes = G.number_of_nodes()
+    raw_edges = G.number_of_edges()
+
+    blocked_edges = [
+        (u, v, k)
+        for u, v, k, data in G.edges(keys=True, data=True)
+        if is_blocked_for_logistics(data)
+    ]
+    G.remove_edges_from(blocked_edges)
+    G.remove_nodes_from(list(nx.isolates(G)))
+    G = keep_largest_component(G)
+
+    elapsed = time.time() - start
+    print(f"  Raw graph:       {raw_nodes:,} nodes | {raw_edges:,} edges")
+    print(f"  Removed edges:   {len(blocked_edges):,}")
+    print(f"  Routing graph:   {G.number_of_nodes():,} nodes | {G.number_of_edges():,} edges")
+    print(f"  Download/clean:  {elapsed:.1f}s")
+
+    return G
+
+
+def download_feature_layer(tags: dict[str, Any], layer_name: str) -> gpd.GeoDataFrame | None:
+    """Download polygon GIS features for optional map/dashboard use."""
+    try:
+        gdf = ox.features_from_place(PLACE, tags=tags)
+        gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])]
+        print(f"  {layer_name}: {len(gdf):,} polygons")
+        return gdf
+    except Exception as exc:
+        print(f"  {layer_name}: skipped ({exc})")
+        return None
+
+
+def export_outputs(G: nx.MultiDiGraph) -> None:
+    """Save GraphML, nodes GeoJSON, edges GeoJSON, and compact GIS layers."""
+    print("\n[4/5] Converting graph to GeoDataFrames...")
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
+
+    print(f"  Nodes GDF: {len(nodes_gdf):,} rows | CRS: {nodes_gdf.crs}")
+    print(f"  Edges GDF: {len(edges_gdf):,} rows | CRS: {edges_gdf.crs}")
+
+    print("\n[5/5] Saving outputs...")
+
+    graphml_path = OUTPUT_DIR / "dong_da_graph.graphml"
+    ox.save_graphml(G, filepath=graphml_path)
+    print(f"  GraphML:       {graphml_path}")
+
+    nodes_path = OUTPUT_DIR / "dong_da_nodes.geojson"
+    nodes_export = clean_object_columns(nodes_gdf)
+    nodes_export.to_file(nodes_path, driver="GeoJSON")
+    print(f"  Nodes GeoJSON: {nodes_path}")
+
+    edges_path = OUTPUT_DIR / "dong_da_edges.geojson"
+    edges_export = clean_object_columns(edges_gdf.reset_index())
+    keep_cols = [col for col in EXPORT_EDGE_COLUMNS if col in edges_export.columns]
+    edges_export = edges_export[keep_cols]
+    edges_export.to_file(edges_path, driver="GeoJSON")
+    print(f"  Edges GeoJSON: {edges_path}")
+
+
+def load_saved_layer(name: str) -> gpd.GeoDataFrame | None:
+    """Load an optional saved GeoJSON layer if it exists."""
+    path = OUTPUT_DIR / f"dong_da_{name}.geojson"
+    if not path.exists():
+        return None
+    try:
+        return gpd.read_file(path)
+    except Exception:
+        return None
+
+
+def static_road_style(highway: Any) -> tuple[str, str, float, float, int, float]:
+    highway = normalize_highway(highway)
+    return STATIC_ROAD_STYLE.get(highway, STATIC_ROAD_STYLE["_default"])
+
+
+def iter_latlon_paths(geometry: Any):
+    """Yield Folium-ready [(lat, lon), ...] paths from line geometries."""
+    if isinstance(geometry, str):
+        try:
+            from shapely import wkt
+
+            geometry = wkt.loads(geometry)
+        except Exception:
+            return
+    if geometry is None or geometry.is_empty:
+        return
+    if geometry.geom_type == "LineString":
+        yield [(lat, lon) for lon, lat in geometry.coords]
+    elif geometry.geom_type == "MultiLineString":
+        for part in geometry.geoms:
+            yield [(lat, lon) for lon, lat in part.coords]
+
+
+def save_static_map(G: nx.MultiDiGraph) -> None:
+    """Save a static, report-friendly PNG map of the optimized graph."""
+    print("\n[MAP] Rendering static PNG map...")
+
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
+    buildings = load_saved_layer("buildings")
+    parks = load_saved_layer("parks")
+    water = load_saved_layer("water")
+
+    fig, ax = plt.subplots(1, 1, figsize=(18, 20), dpi=220, facecolor="#f4efe7")
+    ax.set_facecolor("#f4efe7")
+
+    bounds = nodes_gdf.total_bounds
+    margin = 0.004
+    ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
+    ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
+
+    if parks is not None and len(parks) > 0:
+        parks.plot(
+            ax=ax,
+            color="#c8e6c9",
+            edgecolor="#a5d6a7",
+            linewidth=0.25,
+            alpha=0.85,
+            zorder=1,
+        )
+
+    if water is not None and len(water) > 0:
+        water.plot(
+            ax=ax,
+            color="#b3d9ff",
+            edgecolor="#90c4e8",
+            linewidth=0.35,
+            alpha=0.92,
+            zorder=2,
+        )
+
+    if buildings is not None and len(buildings) > 0:
+        buildings.plot(
+            ax=ax,
+            color="#d6cfc8",
+            edgecolor="#bdb5ad",
+            linewidth=0.08,
+            alpha=0.72,
+            zorder=3,
+        )
+
+    highway_col = edges_gdf["highway"].map(normalize_highway)
+    render_order = [
+        "service",
+        "living_street",
+        "unclassified",
+        "road",
+        "residential",
+        "tertiary",
+        "secondary",
+        "primary",
+        "trunk",
+        "motorway",
+    ]
+
+    other_types = [t for t in highway_col.unique() if t not in render_order]
+    for road_type in other_types + render_order:
+        subset = edges_gdf[highway_col == road_type]
+        if len(subset) == 0:
+            continue
+
+        outline, fill, outline_width, fill_width, zorder, alpha = static_road_style(road_type)
+        subset.plot(
+            ax=ax,
+            color=outline,
+            linewidth=outline_width,
+            alpha=alpha * 0.65,
+            zorder=zorder,
+            capstyle="round",
+            joinstyle="round",
+        )
+        subset.plot(
+            ax=ax,
+            color=fill,
+            linewidth=fill_width,
+            alpha=alpha,
+            zorder=zorder + 0.1,
+            capstyle="round",
+            joinstyle="round",
+        )
+
+    ax.set_title(
+        "Dong Da District - Optimized Logistics Road Graph",
+        fontsize=15,
+        fontweight="bold",
+        loc="left",
+        pad=12,
+        color="#111827",
+    )
+    ax.text(
+        1.0,
+        1.01,
+        "OpenStreetMap | OSMnx + GeoPandas",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=8,
+        color="#6b7280",
+    )
+    ax.set_axis_off()
+
+    out_path = OUTPUT_DIR / "dong_da_static_map.png"
+    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Static map PNG: {out_path}")
+
+
+def save_interactive_map(G: nx.MultiDiGraph) -> None:
+    """Save an interactive HTML map with road tooltips and optional layers."""
+    print("\n[MAP] Rendering interactive HTML map...")
+
+    if folium is None:
+        print("  Folium is not installed. Run: pip install folium")
+        return
+
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
+    center_lat = float(nodes_gdf.geometry.y.mean())
+    center_lon = float(nodes_gdf.geometry.x.mean())
+
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=14,
+        tiles="cartodbpositron",
+        control_scale=True,
+    )
+
+    optional_layers = [
+        ("Parks", "parks", "#7cb342", "#c8e6c9"),
+        ("Water", "water", "#42a5f5", "#b3d9ff"),
+        ("Buildings", "buildings", "#9e9e9e", "#d6cfc8"),
+    ]
+    for label, name, border_color, fill_color in optional_layers:
+        layer = load_saved_layer(name)
+        if layer is None or len(layer) == 0:
+            continue
+        folium.GeoJson(
+            layer,
+            name=label,
+            style_function=lambda _feature, bc=border_color, fc=fill_color: {
+                "color": bc,
+                "weight": 0.5,
+                "fillColor": fc,
+                "fillOpacity": 0.45,
+            },
+        ).add_to(m)
+
+    road_group = folium.FeatureGroup(name="Routing roads", show=True)
+    for _, row in edges_gdf.iterrows():
+        highway = normalize_highway(row.get("highway"))
+        color, width = INTERACTIVE_ROAD_STYLE.get(highway, ("#6b7280", 2))
+        road_name = display_value(row.get("name"))
+        length = to_float(row.get("length"), 0.0)
+        time_min = to_float(row.get("weight_time"), 0.0)
+
+        tooltip = (
+            f"{road_name}"
+            f" | {highway}"
+            f" | {length:.0f} m"
+            f" | {time_min:.1f} min"
+        )
+
+        for path in iter_latlon_paths(row.geometry):
+            folium.PolyLine(
+                path,
+                color=color,
+                weight=width,
+                opacity=0.78,
+                tooltip=tooltip,
+            ).add_to(road_group)
+
+    road_group.add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+
+    out_path = OUTPUT_DIR / "dong_da_interactive_map.html"
+    m.save(out_path)
+    print(f"  Interactive map HTML: {out_path}")
+
+
+def save_feature_layers() -> None:
+    """
+    Download useful GIS layers once and save them for dashboards/rendering.
+
+    The routing graph does not depend on these layers, so failures here should
+    not block shortest path or VRP work.
+    """
+    print("\n[3/5] Downloading optional GIS feature layers...")
+
+    layers = {
+        "buildings": download_feature_layer({"building": True}, "Buildings"),
+        "parks": download_feature_layer(
+            {
+                "leisure": ["park", "garden", "recreation_ground"],
+                "landuse": ["grass", "meadow", "recreation_ground", "village_green"],
+            },
+            "Parks/Green",
+        ),
+        "water": download_feature_layer(
+            {
+                "natural": ["water", "wetland"],
+                "waterway": ["riverbank"],
+                "landuse": ["reservoir", "basin"],
+            },
+            "Water",
+        ),
+    }
+
+    for name, gdf in layers.items():
+        if gdf is None or len(gdf) == 0:
+            continue
+        out_path = OUTPUT_DIR / f"dong_da_{name}.geojson"
+        clean_object_columns(gdf[["geometry"]].copy()).to_file(out_path, driver="GeoJSON")
+        print(f"  {name.title()} GeoJSON: {out_path}")
+
+
+def print_summary(G: nx.MultiDiGraph) -> None:
+    edges = ox.graph_to_gdfs(G, nodes=False, edges=True)
+    highway_counts = edges["highway"].value_counts().head(12)
+    total_km = edges["length"].sum() / 1000.0 if "length" in edges.columns else 0.0
+
+    print("\n" + "=" * 70)
+    print("  PART 1 COMPLETE — Optimized Routing Graph Built")
+    print("=" * 70)
+    print(f"""
+GRAPH SUMMARY:
+  Type        : {type(G).__name__}
+  Nodes       : {G.number_of_nodes():,}
+  Edges       : {G.number_of_edges():,}
+  simplify    : True  (faster routing, edge geometry retained)
+  component   : Largest weakly connected component
+  CRS         : {G.graph.get("crs", "unknown")}
+  Length      : {total_km:.1f} km
+
+EDGE WEIGHTS:
+  weight_distance   — distance in km
+  weight_time       — travel time in minutes
+  weight_congestion — time × congestion factor
+  weight_logistics  — composite VND-like cost
+
+OUTPUT FILES:
+  {OUTPUT_DIR / "dong_da_graph.graphml"}
+  {OUTPUT_DIR / "dong_da_nodes.geojson"}
+  {OUTPUT_DIR / "dong_da_edges.geojson"}
+  {OUTPUT_DIR / "dong_da_buildings.geojson"}
+  {OUTPUT_DIR / "dong_da_parks.geojson"}
+  {OUTPUT_DIR / "dong_da_water.geojson"}
+""")
+
+    print("TOP ROAD TYPES:")
+    for road_type, count in highway_counts.items():
+        bar = "#" * min(int(count / max(highway_counts.max(), 1) * 30), 30)
+        print(f"  {str(road_type):18s}: {count:5,}  {bar}")
+
+    print("\nREADY FOR PART 2:")
+    print('  G = ox.load_graphml("./dong_da_output/dong_da_graph.graphml")')
+    print('  path = nx.shortest_path(G, source=u, target=v, weight="weight_time")')
+    print("=" * 70)
+
+
+def run_part1_only() -> None:
+    print("=" * 70)
+    print("  CITY LOGISTICS & ROUTING — PART 1 OPTIMIZED")
+    print("  Dong Da District, Hanoi, Vietnam")
+    print("=" * 70)
+
+    G = build_routing_graph()
+
+    print("\n[2/5] Adding logistics weights...")
+    G = add_logistics_weights(G)
+    print("  Added: distance, time, congestion, logistics cost, capacity")
+
+    save_feature_layers()
+    export_outputs(G)
+    save_static_map(G)
+    save_interactive_map(G)
+    print_summary(G)
+
+"""
+=============================================================================
+CITY LOGISTICS & ROUTING SYSTEM — PARTS 2 TO 5
+=============================================================================
+Requires Part 1 output:
+  ./dong_da_output/dong_da_graph.graphml
+
+Pipeline:
+  Part 2 — shortest routes + distance/time matrices
+  Part 3 — zone division
+  Part 4 — VRP route optimization
+  Part 5 — simulation + dashboard
+=============================================================================
+"""
+
+import heapq
+import json
+import math
+import random
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import networkx as nx
+import numpy as np
+import osmnx as ox
+import matplotlib.pyplot as plt
+
+try:
+    import folium
+except ImportError:
+    folium = None
+
+
+OUTPUT_DIR = Path("./dong_da_output")
+GRAPH_PATH = OUTPUT_DIR / "dong_da_graph.graphml"
+
+N_DEPOTS = 3
+N_DELIVERIES = 100
+N_SHIPPERS = 8
+RANDOM_SEED = 42
+
+SHIPPER_CAPACITY_KG = 45.0
+SHIPPER_MAX_TIME_MIN = 300.0
+SERVICE_TIME_MIN = 3.0
+WORKING_START_HOUR = 8
+
+UNREACHABLE = 9999.0
+
+MAP_COLORS = [
+    "#e74c3c",
+    "#3498db",
+    "#2ecc71",
+    "#f39c12",
+    "#9b59b6",
+    "#1abc9c",
+    "#e67e22",
+    "#34495e",
+    "#ff6b6b",
+    "#4ecdc4",
+]
+
+DSA_OUTPUT_DIR = OUTPUT_DIR / "dsa_evaluation"
+DSA_SEGMENT_TREE_OPS = 5000
+DSA_TABU_ITERATIONS = 120
+DSA_HEAP_DYNAMIC_EVENTS = 200
+
+
+# =============================================================================
+# COMMON HELPERS
+# =============================================================================
+
+def ensure_output_dir() -> None:
+    OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+def ensure_dsa_output_dir() -> None:
+    DSA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def reset_dsa_output_dir() -> None:
+    ensure_dsa_output_dir()
+    for path in DSA_OUTPUT_DIR.glob("*"):
+        if path.is_file():
+            path.unlink()
+
+
+def to_float(value: Any, default: float) -> float:
+    if isinstance(value, (list, tuple)) and value:
+        value = value[0]
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_graph_numeric_attrs(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
+    numeric_attrs = [
+        "length",
+        "speed_kph",
+        "travel_time",
+        "weight_distance",
+        "weight_time",
+        "weight_congestion",
+        "weight_logistics",
+        "congestion_factor",
+        "capacity",
+    ]
+    for _, _, _, data in G.edges(keys=True, data=True):
+        for attr in numeric_attrs:
+            if attr in data:
+                data[attr] = to_float(data[attr], 0.0)
+    return G
+
+
+def load_graph() -> nx.MultiDiGraph:
+    if not GRAPH_PATH.exists():
+        raise FileNotFoundError(
+            f"Missing {GRAPH_PATH}. Run part1_optimized.py first."
+        )
+    G = ox.load_graphml(GRAPH_PATH)
+    G = normalize_graph_numeric_attrs(G)
+    if not nx.is_weakly_connected(G):
+        largest = max(nx.weakly_connected_components(G), key=len)
+        G = G.subgraph(largest).copy()
+    return G
+
+
+def save_json(path: Path, payload: Any) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def load_json(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def matrix_index_to_order_idx(matrix_idx: int) -> int:
+    return matrix_idx - N_DEPOTS
+
+
+def order_idx_to_matrix_index(order_idx: int) -> int:
+    return order_idx + N_DEPOTS
+
+
+def graph_node_from_matrix_index(matrix_idx: int) -> str:
+    matrix_nodes = load_json(OUTPUT_DIR / "matrix_nodes.json")["nodes"]
+    return str(matrix_nodes[matrix_idx])
+
+
+def resolve_graph_node(G: nx.MultiDiGraph, node: Any) -> Any:
+    """Return a node id using the type stored in the current graph."""
+    if node in G:
+        return node
+
+    text_node = str(node)
+    if text_node in G:
+        return text_node
+
+    try:
+        int_node = int(text_node)
+        if int_node in G:
+            return int_node
+    except (TypeError, ValueError):
+        pass
+
+    return node
+
+
+def node_latlon(G: nx.MultiDiGraph, node: Any) -> tuple[float, float]:
+    data = G.nodes[resolve_graph_node(G, node)]
+    return float(data["y"]), float(data["x"])
+
+
+def edge_latlon_path(G: nx.MultiDiGraph, u: Any, v: Any, weight: str = "weight_time") -> list[tuple[float, float]]:
+    u = resolve_graph_node(G, u)
+    v = resolve_graph_node(G, v)
+    edge_dict = G.get_edge_data(u, v)
+    if not edge_dict:
+        return [node_latlon(G, u), node_latlon(G, v)]
+
+    _, data = min(
+        edge_dict.items(),
+        key=lambda item: to_float(item[1].get(weight), to_float(item[1].get("length"), 1.0)),
+    )
+    geometry = data.get("geometry")
+    paths = list(iter_latlon_paths(geometry))
+    if paths:
+        return paths[0]
+    return [node_latlon(G, u), node_latlon(G, v)]
+
+
+def route_latlon_path(G: nx.MultiDiGraph, route_nodes: list[Any]) -> list[tuple[float, float]]:
+    full_path: list[tuple[float, float]] = []
+    for u, v in zip(route_nodes[:-1], route_nodes[1:]):
+        segment = edge_latlon_path(G, u, v)
+        if full_path and segment:
+            segment = segment[1:]
+        full_path.extend(segment)
+    return full_path
+
+
+def shortest_node_route(G: nx.MultiDiGraph, src: Any, dst: Any, weight: str = "weight_time") -> list[Any]:
+    try:
+        return nx.shortest_path(
+            G,
+            resolve_graph_node(G, src),
+            resolve_graph_node(G, dst),
+            weight=weight,
+        )
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
+        return []
+
+
+def make_base_folium_map(G: nx.MultiDiGraph, name: str) -> Any:
+    if folium is None:
+        return None
+
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
+    center = [float(nodes_gdf.geometry.y.mean()), float(nodes_gdf.geometry.x.mean())]
+    fmap = folium.Map(location=center, zoom_start=14, tiles="cartodbpositron", control_scale=True)
+
+    for layer_name, file_name, stroke, fill, opacity in [
+        ("Parks", "dong_da_parks.geojson", "#7cb342", "#c8e6c9", 0.45),
+        ("Water", "dong_da_water.geojson", "#42a5f5", "#b3d9ff", 0.65),
+        ("Buildings", "dong_da_buildings.geojson", "#9e9e9e", "#d6cfc8", 0.32),
+    ]:
+        path = OUTPUT_DIR / file_name
+        if not path.exists():
+            continue
+        try:
+            layer = path.read_text(encoding="utf-8")
+            folium.GeoJson(
+                layer,
+                name=layer_name,
+                show=True,
+                style_function=lambda _feature, s=stroke, f=fill, o=opacity: {
+                    "color": s,
+                    "weight": 0.4,
+                    "fillColor": f,
+                    "fillOpacity": o,
+                },
+            ).add_to(fmap)
+        except Exception:
+            pass
+
+    road_style = {
+        "motorway": ("#f39c12", 4),
+        "trunk": ("#f39c12", 4),
+        "primary": ("#f59e0b", 4),
+        "secondary": ("#ffffff", 3),
+        "tertiary": ("#ffffff", 2),
+        "residential": ("#ffffff", 2),
+        "service": ("#d1d5db", 1),
+        "living_street": ("#d1d5db", 1),
+        "unclassified": ("#d1d5db", 1),
+        "road": ("#ffffff", 2),
+    }
+
+    road_group = folium.FeatureGroup(name="Part 1 detailed road graph", show=True)
+    for _, row in edges_gdf.iterrows():
+        geometry = row.geometry
+        if geometry is None or geometry.is_empty:
+            continue
+        highway = normalize_highway(row.get("highway"))
+        color, width = road_style.get(highway, ("#d1d5db", 1))
+        for coords in iter_latlon_paths(geometry):
+            folium.PolyLine(coords, color=color, weight=width, opacity=0.45).add_to(road_group)
+    road_group.add_to(fmap)
+
+    title_html = f"""
+    <div style="position: fixed; top: 12px; left: 50px; z-index: 9999;
+                background: white; padding: 8px 12px; border: 1px solid #ddd;
+                border-radius: 6px; font-family: Arial; font-size: 14px;">
+      <b>{name}</b>
+    </div>
+    """
+    fmap.get_root().html.add_child(folium.Element(title_html))
+    return fmap
+
+
+def save_folium_map(fmap: Any, filename: str) -> None:
+    if fmap is None:
+        print(f"  Skipped {filename}: folium is not installed")
+        return
+    folium.LayerControl(collapsed=False).add_to(fmap)
+    path = OUTPUT_DIR / filename
+    fmap.save(path)
+    print(f"  Interactive map: {path}")
+
+
+def load_layer_geojson(filename: str):
+    path = OUTPUT_DIR / filename
+    if not path.exists():
+        return None
+    try:
+        return gpd.read_file(path)
+    except Exception:
+        return None
+
+
+def plot_part1_detailed_base(
+    ax: Any,
+    G: nx.MultiDiGraph,
+    title: str,
+    show_title: bool = True,
+) -> None:
+    """Draw the same detailed base map style as Part 1, then overlays can be added."""
+    nodes_gdf, edges_gdf = ox.graph_to_gdfs(G, nodes=True, edges=True)
+
+    ax.set_facecolor("#f4efe7")
+    bounds = nodes_gdf.total_bounds
+    margin = 0.004
+    ax.set_xlim(bounds[0] - margin, bounds[2] + margin)
+    ax.set_ylim(bounds[1] - margin, bounds[3] + margin)
+
+    for filename, color, edge, alpha, zorder in [
+        ("dong_da_parks.geojson", "#c8e6c9", "#a5d6a7", 0.85, 1),
+        ("dong_da_water.geojson", "#b3d9ff", "#90c4e8", 0.92, 2),
+        ("dong_da_buildings.geojson", "#d6cfc8", "#bdb5ad", 0.72, 3),
+    ]:
+        layer = load_layer_geojson(filename)
+        if layer is not None and len(layer) > 0:
+            layer.plot(
+                ax=ax,
+                color=color,
+                edgecolor=edge,
+                linewidth=0.08 if "buildings" in filename else 0.25,
+                alpha=alpha,
+                zorder=zorder,
+            )
+
+    style = {
+        "motorway": ("#e67e22", "#f39c12", 3.2, 2.0, 9, 1.0),
+        "trunk": ("#e67e22", "#f39c12", 3.0, 1.9, 9, 1.0),
+        "primary": ("#d97706", "#fbbf24", 2.6, 1.6, 8, 1.0),
+        "secondary": ("#9ca3af", "#ffffff", 2.0, 1.2, 7, 1.0),
+        "tertiary": ("#9ca3af", "#ffffff", 1.5, 0.9, 6, 0.95),
+        "residential": ("#a3a3a3", "#ffffff", 1.1, 0.7, 5, 0.9),
+        "service": ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
+        "living_street": ("#bdbdbd", "#f3f4f6", 0.8, 0.45, 4, 0.82),
+        "unclassified": ("#bdbdbd", "#eeeeee", 0.8, 0.45, 4, 0.82),
+        "road": ("#a3a3a3", "#ffffff", 1.0, 0.65, 5, 0.9),
+    }
+    highway_col = edges_gdf["highway"].map(lambda value: str(value).lower())
+    render_order = [
+        "service",
+        "living_street",
+        "unclassified",
+        "road",
+        "residential",
+        "tertiary",
+        "secondary",
+        "primary",
+        "trunk",
+        "motorway",
+    ]
+    other_types = [t for t in highway_col.unique() if t not in render_order]
+    for road_type in other_types + render_order:
+        subset = edges_gdf[highway_col == road_type]
+        if len(subset) == 0:
+            continue
+        outline, fill, outline_width, fill_width, zorder, alpha = style.get(
+            road_type,
+            ("#bdbdbd", "#dddddd", 0.7, 0.4, 3, 0.75),
+        )
+        subset.plot(
+            ax=ax,
+            color=outline,
+            linewidth=outline_width,
+            alpha=alpha * 0.6,
+            zorder=zorder,
+            capstyle="round",
+            joinstyle="round",
+        )
+        subset.plot(
+            ax=ax,
+            color=fill,
+            linewidth=fill_width,
+            alpha=alpha,
+            zorder=zorder + 0.1,
+            capstyle="round",
+            joinstyle="round",
+        )
+
+    if show_title:
+        ax.set_title(title, fontsize=13, fontweight="bold", loc="left", pad=10, color="#111827")
+    ax.set_axis_off()
+
+
+# =============================================================================
+# PART 2 — SHORTEST ROUTE CALCULATION
+# =============================================================================
+
+def generate_delivery_points(G: nx.MultiDiGraph) -> tuple[list[int], list[int], list[int]]:
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
+    nodes = list(G.nodes())
+    if len(nodes) < N_DEPOTS + N_DELIVERIES:
+        raise ValueError("Graph has fewer nodes than requested depots + deliveries.")
+
+    sampled = random.sample(nodes, N_DEPOTS + N_DELIVERIES)
+    depots = sampled[:N_DEPOTS]
+    deliveries = sampled[N_DEPOTS:]
+    return depots, deliveries, depots + deliveries
+
+
+def build_point_metadata(G: nx.MultiDiGraph, depots: list[int], deliveries: list[int]) -> dict[str, Any]:
+    rng = random.Random(RANDOM_SEED)
+    return {
+        "depots": [
+            {
+                "node_id": str(node),
+                "matrix_index": i,
+                "lat": float(G.nodes[node]["y"]),
+                "lon": float(G.nodes[node]["x"]),
+                "name": f"Kho {i + 1}",
+            }
+            for i, node in enumerate(depots)
+        ],
+        "deliveries": [
+            {
+                "node_id": str(node),
+                "matrix_index": order_idx_to_matrix_index(i),
+                "order_index": i,
+                "order_id": f"ORD-{1000 + i}",
+                "lat": float(G.nodes[node]["y"]),
+                "lon": float(G.nodes[node]["x"]),
+                "weight_kg": round(rng.uniform(0.5, 8.0), 1),
+                "time_window": [
+                    f"{rng.randint(8, 11):02d}:00",
+                    f"{rng.randint(14, 18):02d}:00",
+                ],
+            }
+            for i, node in enumerate(deliveries)
+        ],
+    }
+
+
+def build_matrix(
+    G: nx.MultiDiGraph,
+    points: list[int],
+    weight: str,
+    label: str,
+) -> np.ndarray:
+    n = len(points)
+    matrix = np.full((n, n), UNREACHABLE, dtype=np.float32)
+    np.fill_diagonal(matrix, 0.0)
+
+    point_set = set(points)
+    point_to_idx = {node: idx for idx, node in enumerate(points)}
+
+    start = time.time()
+    for i, source in enumerate(points):
+        lengths = nx.single_source_dijkstra_path_length(G, source, weight=weight)
+        for target, value in lengths.items():
+            if target in point_set:
+                matrix[i, point_to_idx[target]] = float(value)
+
+        if (i + 1) % 10 == 0 or i == n - 1:
+            elapsed = time.time() - start
+            eta = elapsed / (i + 1) * (n - i - 1)
+            print(f"  {label}: {i + 1}/{n} | elapsed={elapsed:.1f}s | ETA={eta:.0f}s")
+
+    return matrix
+
+
+def part2_shortest_routes(G: nx.MultiDiGraph) -> dict[str, Any]:
+    print("\n" + "=" * 70)
+    print("PART 2 — SHORTEST ROUTE CALCULATION")
+    print("=" * 70)
+
+    depots, deliveries, all_points = generate_delivery_points(G)
+    metadata = build_point_metadata(G, depots, deliveries)
+    save_json(OUTPUT_DIR / "delivery_nodes.json", metadata)
+    save_json(
+        OUTPUT_DIR / "matrix_nodes.json",
+        {"nodes": [str(n) for n in all_points], "n_depots": N_DEPOTS},
+    )
+
+    print(f"Generated {N_DEPOTS} depots and {N_DELIVERIES} delivery points")
+
+    time_matrix = build_matrix(G, all_points, "weight_time", "time_matrix")
+    dist_matrix = build_matrix(G, all_points, "weight_distance", "dist_matrix")
+
+    np.save(OUTPUT_DIR / "time_matrix.npy", time_matrix)
+    np.save(OUTPUT_DIR / "dist_matrix.npy", dist_matrix)
+
+    finite = time_matrix < UNREACHABLE
+    summary = {
+        "n_points": len(all_points),
+        "reachable_pairs": int(finite.sum()),
+        "total_pairs": int(time_matrix.size),
+        "reachable_pct": round(float(finite.mean() * 100), 2),
+        "mean_time_min": round(float(time_matrix[(time_matrix > 0) & finite].mean()), 2),
+    }
+    save_json(OUTPUT_DIR / "part2_summary.json", summary)
+    visualize_part2_shortest_routes(G, metadata)
+    print(f"Reachable pairs: {summary['reachable_pct']}%")
+    return metadata
+
+
+def visualize_part2_shortest_routes(G: nx.MultiDiGraph, metadata: dict[str, Any]) -> None:
+    """Visualize 100 orders and shortest routes from the nearest depot."""
+    print("\n[VIS] Part 2 shortest routes...")
+
+    depots = metadata["depots"]
+    deliveries = metadata["deliveries"]
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+
+    # Assign each order to the depot with the lowest travel time.
+    route_specs = []
+    for delivery in deliveries:
+        dst_idx = int(delivery["matrix_index"])
+        best_depot = min(depots, key=lambda depot: float(time_matrix[int(depot["matrix_index"]), dst_idx]))
+        src_node = best_depot["node_id"]
+        dst_node = delivery["node_id"]
+        route_nodes = shortest_node_route(G, src_node, dst_node)
+        if route_nodes:
+            route_specs.append((best_depot, delivery, route_nodes))
+
+    fig, ax = plt.subplots(figsize=(14, 14), dpi=180, facecolor="#f4efe7")
+    plot_part1_detailed_base(
+        ax,
+        G,
+        "Part 2 - 100 Orders and Shortest Routes on Part 1 Map",
+    )
+
+    for depot_idx, depot in enumerate(depots):
+        color = MAP_COLORS[depot_idx % len(MAP_COLORS)]
+        depot_routes = [spec for spec in route_specs if spec[0]["name"] == depot["name"]]
+        for _, _, route_nodes in depot_routes:
+            path = route_latlon_path(G, route_nodes)
+            if len(path) < 2:
+                continue
+            lats = [p[0] for p in path]
+            lons = [p[1] for p in path]
+            ax.plot(lons, lats, color=color, linewidth=0.9, alpha=0.42, zorder=20)
+
+        ax.scatter(depot["lon"], depot["lat"], s=130, marker="s", color=color, edgecolor="white", zorder=31)
+        ax.text(depot["lon"], depot["lat"], depot["name"], fontsize=8, color="#111827", zorder=32)
+
+    ax.scatter(
+        [d["lon"] for d in deliveries],
+        [d["lat"] for d in deliveries],
+        s=18,
+        color="#f97316",
+        edgecolor="white",
+        linewidth=0.3,
+        alpha=0.9,
+        zorder=30,
+    )
+    out_path = OUTPUT_DIR / "part2_shortest_routes.png"
+    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Static map: {out_path}")
+
+    fmap = make_base_folium_map(G, "Part 2 - Shortest Routes for 100 Orders")
+    if fmap is not None:
+        for depot_idx, depot in enumerate(depots):
+            color = MAP_COLORS[depot_idx % len(MAP_COLORS)]
+            group = folium.FeatureGroup(name=f"{depot['name']} shortest routes", show=True)
+            for _, delivery, route_nodes in [spec for spec in route_specs if spec[0]["name"] == depot["name"]]:
+                path = route_latlon_path(G, route_nodes)
+                if len(path) >= 2:
+                    folium.PolyLine(
+                        path,
+                        color=color,
+                        weight=2,
+                        opacity=0.45,
+                        tooltip=f"{depot['name']} -> {delivery['order_id']}",
+                    ).add_to(group)
+                folium.CircleMarker(
+                    [delivery["lat"], delivery["lon"]],
+                    radius=3,
+                    color=color,
+                    fill=True,
+                    fill_opacity=0.8,
+                    tooltip=f"{delivery['order_id']} | {delivery['weight_kg']}kg",
+                ).add_to(group)
+            folium.Marker(
+                [depot["lat"], depot["lon"]],
+                tooltip=depot["name"],
+                icon=folium.Icon(color="red", icon="home"),
+            ).add_to(group)
+            group.add_to(fmap)
+    save_folium_map(fmap, "part2_shortest_routes.html")
+
+
+# =============================================================================
+# DSA UPGRADE EVALUATION
+# =============================================================================
+
+def save_dsa_json(filename: str, payload: Any) -> Path:
+    ensure_dsa_output_dir()
+    path = DSA_OUTPUT_DIR / filename
+    save_json(path, payload)
+    return path
+
+
+def save_dsa_csv(filename: str, rows: list[dict[str, Any]]) -> Path:
+    ensure_dsa_output_dir()
+    path = DSA_OUTPUT_DIR / filename
+    pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
+    return path
+
+
+class SegmentTree:
+    """Segment tree for fast route-leg cost updates and range sums."""
+
+    def __init__(self, values: list[float]) -> None:
+        self.n = len(values)
+        size = 1
+        while size < max(1, self.n):
+            size *= 2
+        self.size = size
+        self.tree = [0.0] * (2 * size)
+        for idx, value in enumerate(values):
+            self.tree[size + idx] = float(value)
+        for idx in range(size - 1, 0, -1):
+            self.tree[idx] = self.tree[idx * 2] + self.tree[idx * 2 + 1]
+
+    def update(self, index: int, value: float) -> None:
+        pos = self.size + index
+        self.tree[pos] = float(value)
+        pos //= 2
+        while pos:
+            self.tree[pos] = self.tree[pos * 2] + self.tree[pos * 2 + 1]
+            pos //= 2
+
+    def range_sum(self, left: int, right: int) -> float:
+        left += self.size
+        right += self.size
+        total = 0.0
+        while left < right:
+            if left % 2:
+                total += self.tree[left]
+                left += 1
+            if right % 2:
+                right -= 1
+                total += self.tree[right]
+            left //= 2
+            right //= 2
+        return total
+
+
+def matrix_to_coo(matrix: np.ndarray, finite_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    rows, cols = np.nonzero(finite_mask)
+    values = matrix[rows, cols].astype(np.float32)
+    return rows.astype(np.int32), cols.astype(np.int32), values
+
+
+def evaluate_sparse_matrix_upgrade() -> dict[str, Any]:
+    print("\n[DSA 5/8] Dense matrix vs sparse COO benchmark...")
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    dist_matrix = np.load(OUTPUT_DIR / "dist_matrix.npy")
+    finite_mask = (time_matrix < UNREACHABLE) & np.isfinite(time_matrix)
+
+    start = time.perf_counter()
+    time_rows, time_cols, time_values = matrix_to_coo(time_matrix, finite_mask)
+    dist_rows, dist_cols, dist_values = matrix_to_coo(dist_matrix, finite_mask)
+    build_time = time.perf_counter() - start
+
+    ensure_dsa_output_dir()
+    sparse_path = DSA_OUTPUT_DIR / "05_sparse_matrices_coo.npz"
+    np.savez_compressed(
+        sparse_path,
+        time_rows=time_rows,
+        time_cols=time_cols,
+        time_values=time_values,
+        dist_rows=dist_rows,
+        dist_cols=dist_cols,
+        dist_values=dist_values,
+        shape=np.asarray(time_matrix.shape, dtype=np.int32),
+    )
+
+    dense_bytes = int(time_matrix.nbytes + dist_matrix.nbytes)
+    sparse_bytes = int(
+        time_rows.nbytes
+        + time_cols.nbytes
+        + time_values.nbytes
+        + dist_rows.nbytes
+        + dist_cols.nbytes
+        + dist_values.nbytes
+    )
+    density = len(time_values) / max(time_matrix.size, 1)
+    metrics = {
+        "upgrade": "Dense Matrix -> Sparse COO Matrix",
+        "part": "Part 2 & 3",
+        "matrix_shape": list(time_matrix.shape),
+        "dense_storage_bytes": dense_bytes,
+        "sparse_coo_storage_bytes": sparse_bytes,
+        "reachable_entries": int(len(time_values)),
+        "total_entries": int(time_matrix.size),
+        "density_pct": round(density * 100, 4),
+        "storage_reduction_x": round(dense_bytes / max(sparse_bytes, 1), 2),
+        "build_time_sec": round(build_time, 6),
+        "output_files": [str(sparse_path)],
+    }
+    save_dsa_json("05_sparse_matrix_metrics.json", metrics)
+    save_dsa_csv("05_sparse_matrix_metrics.csv", [metrics])
+    print(f"  Dense bytes: {dense_bytes:,} | sparse bytes: {sparse_bytes:,}")
+    return metrics
+
+
+def route_leg_costs(path: list[int], time_matrix: np.ndarray) -> list[float]:
+    return [float(time_matrix[src, dst]) for src, dst in zip(path[:-1], path[1:])]
+
+
+def evaluate_segment_tree_upgrade(solution: dict[str, Any]) -> dict[str, Any]:
+    print("\n[DSA 6/8] Python list recompute vs Segment Tree benchmark...")
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    routes = [route for route in solution["schedule"] if len(route["route_stops"]) >= 3]
+    if not routes:
+        metrics = {"upgrade": "Python List -> Segment Tree", "part": "Part 4", "note": "No route with enough stops."}
+        save_dsa_json("06_segment_tree_metrics.json", metrics)
+        return metrics
+
+    route = max(routes, key=lambda item: len(item["route_stops"]))
+    leg_costs = route_leg_costs(route["route_stops"], time_matrix)
+    rng = random.Random(RANDOM_SEED)
+    updates = [
+        (rng.randrange(len(leg_costs)), rng.uniform(0.5, max(max(leg_costs), 1.0) * 1.5))
+        for _ in range(DSA_SEGMENT_TREE_OPS)
+    ]
+
+    list_costs = leg_costs[:]
+    start = time.perf_counter()
+    list_checksum = 0.0
+    for index, new_value in updates:
+        list_costs[index] = new_value
+        list_checksum += sum(list_costs)
+    list_time = time.perf_counter() - start
+
+    tree = SegmentTree(leg_costs)
+    start = time.perf_counter()
+    tree_checksum = 0.0
+    current = leg_costs[:]
+    for index, new_value in updates:
+        current[index] = new_value
+        tree.update(index, current[index])
+        tree_checksum += tree.range_sum(0, len(current))
+    tree_time = time.perf_counter() - start
+
+    metrics = {
+        "upgrade": "Python List route cost recompute -> Segment Tree",
+        "part": "Part 4",
+        "route_shipper_id": route["shipper_id"],
+        "route_leg_count": len(leg_costs),
+        "benchmark_operations": len(updates),
+        "list_recompute_time_sec": round(list_time, 6),
+        "segment_tree_update_query_time_sec": round(tree_time, 6),
+        "speedup_x": round(list_time / max(tree_time, 1e-9), 2),
+        "checksum_match": abs(list_checksum - tree_checksum) <= 1e-6,
+        "note": "This benchmarks repeated route-cost updates; actual Python list insertion still shifts elements.",
+    }
+    save_dsa_json("06_segment_tree_metrics.json", metrics)
+    save_dsa_csv("06_segment_tree_metrics.csv", [metrics])
+    print(f"  Segment tree speedup: {metrics['speedup_x']}x")
+    return metrics
+
+
+def route_distance_for_stops(depot_idx: int, stops: list[int], matrix: np.ndarray) -> float:
+    return route_travel_time([depot_idx] + stops + [depot_idx], matrix)
+
+
+def tabu_search_route(
+    depot_idx: int,
+    initial_stops: list[int],
+    time_matrix: np.ndarray,
+    iterations: int = DSA_TABU_ITERATIONS,
+    tabu_tenure: int = 12,
+) -> tuple[list[int], float, list[dict[str, Any]]]:
+    if len(initial_stops) < 4:
+        cost = route_distance_for_stops(depot_idx, initial_stops, time_matrix)
+        return initial_stops[:], cost, []
+
+    current = initial_stops[:]
+    best = current[:]
+    current_cost = route_distance_for_stops(depot_idx, current, time_matrix)
+    best_cost = current_cost
+    tabu: dict[tuple[int, int], int] = {}
+    history = []
+
+    for iteration in range(iterations):
+        candidate = None
+        candidate_move = None
+        candidate_cost = float("inf")
+
+        for i in range(len(current) - 1):
+            for j in range(i + 1, len(current)):
+                move = (min(current[i], current[j]), max(current[i], current[j]))
+                trial = current[:]
+                trial[i], trial[j] = trial[j], trial[i]
+                cost = route_distance_for_stops(depot_idx, trial, time_matrix)
+                aspiration = cost < best_cost
+                if tabu.get(move, -1) > iteration and not aspiration:
+                    continue
+                if cost < candidate_cost:
+                    candidate = trial
+                    candidate_move = move
+                    candidate_cost = cost
+
+        if candidate is None or candidate_move is None:
+            break
+
+        current = candidate
+        current_cost = candidate_cost
+        tabu[candidate_move] = iteration + tabu_tenure
+        if current_cost < best_cost:
+            best = current[:]
+            best_cost = current_cost
+
+        history.append(
+            {
+                "iteration": iteration,
+                "current_cost_min": round(float(current_cost), 4),
+                "best_cost_min": round(float(best_cost), 4),
+            }
+        )
+
+    return best, best_cost, history
+
+
+def evaluate_tabu_upgrade(solution: dict[str, Any]) -> dict[str, Any]:
+    print("\n[DSA 7/8] Greedy/2-opt vs Tabu Search benchmark...")
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    routes = [route for route in solution["schedule"] if len(route["route_stops"]) >= 6]
+    if not routes:
+        metrics = {"upgrade": "Greedy/2-opt -> Tabu Search", "part": "Part 4", "note": "No long enough route."}
+        save_dsa_json("07_tabu_search_metrics.json", metrics)
+        return metrics
+
+    route = max(routes, key=lambda item: len(item["route_stops"]))
+    depot_idx = int(route["depot_idx"])
+    initial_stops = [idx for idx in route["route_stops"][1:-1] if idx >= N_DEPOTS]
+    baseline_cost = route_distance_for_stops(depot_idx, initial_stops, time_matrix)
+
+    start = time.perf_counter()
+    best_stops, best_cost, history = tabu_search_route(depot_idx, initial_stops, time_matrix)
+    tabu_time = time.perf_counter() - start
+
+    history_path = save_dsa_csv("07_tabu_search_iterations.csv", history)
+    metrics = {
+        "upgrade": "Greedy + 2-opt -> Tabu Search meta-heuristic",
+        "part": "Part 4",
+        "route_shipper_id": route["shipper_id"],
+        "stop_count": len(initial_stops),
+        "iterations": DSA_TABU_ITERATIONS,
+        "baseline_route_cost_min": round(float(baseline_cost), 4),
+        "tabu_best_cost_min": round(float(best_cost), 4),
+        "improvement_min": round(float(baseline_cost - best_cost), 4),
+        "improvement_pct": round((baseline_cost - best_cost) / max(baseline_cost, 1e-9) * 100, 3),
+        "runtime_sec": round(tabu_time, 6),
+        "best_route_stops": [int(stop) for stop in best_stops],
+        "output_files": [str(history_path)],
+    }
+    save_dsa_json("07_tabu_search_metrics.json", metrics)
+    save_dsa_csv("07_tabu_search_metrics.csv", [metrics])
+    print(f"  Tabu improvement: {metrics['improvement_pct']}%")
+    return metrics
+
+
+def build_simulation_events_from_solution(
+    solution: dict[str, Any],
+    delivery_data: dict[str, Any],
+    time_matrix: np.ndarray,
+) -> list[dict[str, Any]]:
+    deliveries = delivery_data["deliveries"]
+    events = []
+    sequence = 0
+    for route in solution["schedule"]:
+        shipper_id = route["shipper_id"]
+        path = route["route_stops"]
+        current_time = parse_departure_minutes(route["departure"])
+        events.append(
+            {
+                "time_min": round(current_time, 1),
+                "sequence": sequence,
+                "clock": minutes_to_clock(current_time),
+                "type": "DEPART",
+                "shipper_id": shipper_id,
+                "target": route["depot_name"],
+            }
+        )
+        sequence += 1
+        for src, dst in zip(path[:-1], path[1:]):
+            current_time += float(time_matrix[src, dst])
+            if dst >= N_DEPOTS:
+                order_idx = matrix_index_to_order_idx(dst)
+                events.append(
+                    {
+                        "time_min": round(current_time, 1),
+                        "sequence": sequence,
+                        "clock": minutes_to_clock(current_time),
+                        "type": "ARRIVE_ORDER",
+                        "shipper_id": shipper_id,
+                        "target": deliveries[order_idx]["order_id"],
+                    }
+                )
+                sequence += 1
+                current_time += SERVICE_TIME_MIN
+                events.append(
+                    {
+                        "time_min": round(current_time, 1),
+                        "sequence": sequence,
+                        "clock": minutes_to_clock(current_time),
+                        "type": "DELIVERED",
+                        "shipper_id": shipper_id,
+                        "target": deliveries[order_idx]["order_id"],
+                    }
+                )
+                sequence += 1
+            else:
+                events.append(
+                    {
+                        "time_min": round(current_time, 1),
+                        "sequence": sequence,
+                        "clock": minutes_to_clock(current_time),
+                        "type": "RETURN_DEPOT",
+                        "shipper_id": shipper_id,
+                        "target": route["depot_name"],
+                    }
+                )
+                sequence += 1
+    return events
+
+
+def evaluate_minheap_upgrade(solution: dict[str, Any]) -> dict[str, Any]:
+    print("\n[DSA 8/8] Timsort event list vs Min-Heap event queue benchmark...")
+    delivery_data = load_json(OUTPUT_DIR / "delivery_nodes.json")
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    events = build_simulation_events_from_solution(solution, delivery_data, time_matrix)
+    rng = random.Random(RANDOM_SEED)
+    dynamic_events = []
+    for idx in range(DSA_HEAP_DYNAMIC_EVENTS):
+        base = rng.choice(events)
+        dynamic_events.append(
+            {
+                **base,
+                "time_min": round(float(base["time_min"]) + rng.uniform(-5.0, 15.0), 1),
+                "sequence": len(events) + idx,
+                "type": "DYNAMIC_UPDATE",
+            }
+        )
+
+    start = time.perf_counter()
+    sorted_events = sorted(events + dynamic_events, key=lambda item: (item["time_min"], item["sequence"]))
+    sort_time = time.perf_counter() - start
+
+    start = time.perf_counter()
+    heap = []
+    for event in events:
+        heapq.heappush(heap, (event["time_min"], event["sequence"], event))
+    for event in dynamic_events:
+        heapq.heappush(heap, (event["time_min"], event["sequence"], event))
+    heap_events = [heapq.heappop(heap)[2] for _ in range(len(heap))]
+    heap_time = time.perf_counter() - start
+
+    sample_path = save_dsa_csv(
+        "08_minheap_event_order_sample.csv",
+        [
+            {
+                "rank": idx,
+                "time_min": event["time_min"],
+                "clock": event["clock"],
+                "type": event["type"],
+                "shipper_id": event["shipper_id"],
+                "target": event["target"],
+            }
+            for idx, event in enumerate(heap_events[:80])
+        ],
+    )
+    metrics = {
+        "upgrade": "Timsort event list -> Min-Heap priority queue",
+        "part": "Part 5",
+        "base_event_count": len(events),
+        "dynamic_event_count": len(dynamic_events),
+        "total_event_count": len(sorted_events),
+        "timsort_batch_time_sec": round(sort_time, 6),
+        "minheap_push_pop_time_sec": round(heap_time, 6),
+        "speedup_x": round(sort_time / max(heap_time, 1e-9), 2),
+        "same_event_order": [
+            (event["time_min"], event["sequence"]) for event in sorted_events
+        ]
+        == [
+            (event["time_min"], event["sequence"]) for event in heap_events
+        ],
+        "note": "Heap supports online event insertion in O(log n); sorted() is still strong for one-shot batch sorting.",
+        "output_files": [str(sample_path)],
+    }
+    save_dsa_json("08_minheap_metrics.json", metrics)
+    save_dsa_csv("08_minheap_metrics.csv", [metrics])
+    print(f"  Heap same order: {metrics['same_event_order']} | speedup: {metrics['speedup_x']}x")
+    return metrics
+
+
+def save_dsa_evaluation_report(results: list[dict[str, Any]]) -> Path:
+    ensure_dsa_output_dir()
+    summary_rows = []
+    for idx, result in enumerate(results, start=5):
+        summary_rows.append(
+            {
+                "step": idx,
+                "upgrade": result.get("upgrade"),
+                "part": result.get("part"),
+                "key_speedup_or_reduction": (
+                    result.get("storage_reduction_x")
+                    or result.get("speedup_x")
+                    or result.get("improvement_pct")
+                    or "see metrics"
+                ),
+            }
+        )
+
+    summary_csv = save_dsa_csv("00_dsa_upgrade_summary.csv", summary_rows)
+    manifest = {
+        "evaluation_order": [row["upgrade"] for row in summary_rows],
+        "summary_csv": str(summary_csv),
+        "result_files": sorted(str(path) for path in DSA_OUTPUT_DIR.glob("*")),
+    }
+    manifest_path = save_dsa_json("00_dsa_evaluation_manifest.json", manifest)
+
+    lines = [
+        "# DSA Upgrade Evaluation Report",
+        "",
+        "This report benchmarks upgrades 5 to 8 sequentially. Upgrades 1 to 4 are intentionally skipped for this run.",
+        "",
+        "| Step | Upgrade | Part | Main result |",
+        "|---:|---|---|---|",
+    ]
+    for idx, result in enumerate(results, start=5):
+        if "storage_reduction_x" in result:
+            main_result = f"{result['storage_reduction_x']}x storage reduction"
+        elif result.get("upgrade", "").startswith("Greedy"):
+            main_result = f"{result.get('improvement_pct', 0)}% route-cost improvement"
+        elif "speedup_x" in result:
+            main_result = f"{result['speedup_x']}x benchmark speedup"
+        else:
+            main_result = "See JSON/CSV metrics"
+        lines.append(f"| {idx} | {result.get('upgrade')} | {result.get('part')} | {main_result} |")
+
+    lines.extend(["", "## Output Files", ""])
+    for path in sorted(DSA_OUTPUT_DIR.glob("*")):
+        lines.append(f"- `{path}`")
+
+    report_path = DSA_OUTPUT_DIR / "00_dsa_evaluation_report.md"
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    manifest["result_files"] = sorted(str(path) for path in DSA_OUTPUT_DIR.glob("*"))
+    save_json(manifest_path, manifest)
+    print(f"\n[DSA] Report: {report_path}")
+    print(f"[DSA] Manifest: {manifest_path}")
+    return report_path
+
+
+def run_dsa_upgrade_evaluation(
+    G: nx.MultiDiGraph,
+    delivery_data: dict[str, Any],
+    solution: dict[str, Any],
+) -> list[dict[str, Any]]:
+    print("\n" + "=" * 70)
+    print("DSA UPGRADE EVALUATION - STEPS 5 TO 8 ONLY")
+    print("=" * 70)
+    reset_dsa_output_dir()
+    results = [
+        evaluate_sparse_matrix_upgrade(),
+        evaluate_segment_tree_upgrade(solution),
+        evaluate_tabu_upgrade(solution),
+        evaluate_minheap_upgrade(solution),
+    ]
+    save_dsa_evaluation_report(results)
+    return results
+
+
+# =============================================================================
+# PART 3 — ZONE DIVISION
+# =============================================================================
+
+BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz"
+
+
+def encode_geohash(lat: float, lon: float, precision: int = 6) -> str:
+    lat_range = [-90.0, 90.0]
+    lon_range = [-180.0, 180.0]
+    is_lon = True
+    bits = []
+
+    for _ in range(precision * 5):
+        if is_lon:
+            mid = sum(lon_range) / 2
+            bit = lon >= mid
+            lon_range[0 if bit else 1] = mid
+        else:
+            mid = sum(lat_range) / 2
+            bit = lat >= mid
+            lat_range[0 if bit else 1] = mid
+        bits.append(1 if bit else 0)
+        is_lon = not is_lon
+
+    chars = []
+    for i in range(0, len(bits), 5):
+        value = 0
+        for bit in bits[i : i + 5]:
+            value = value * 2 + bit
+        chars.append(BASE32[value])
+    return "".join(chars)
+
+
+def balanced_cluster_sizes(n_items: int, n_clusters: int) -> list[int]:
+    base = n_items // n_clusters
+    extra = n_items % n_clusters
+    return [base + (1 if i < extra else 0) for i in range(n_clusters)]
+
+
+def clean_order_time_matrix(time_matrix: np.ndarray) -> np.ndarray:
+    """Return a finite, symmetric order-to-order cost matrix for k-medoids."""
+    order_time = time_matrix[N_DEPOTS:, N_DEPOTS:].astype(float).copy()
+    finite = order_time < UNREACHABLE
+    fallback = float(np.nanmax(order_time[finite])) if finite.any() else 1.0
+    order_time[~finite] = fallback * 3.0
+    order_time = np.minimum(order_time, order_time.T)
+    np.fill_diagonal(order_time, 0.0)
+    return order_time
+
+
+def initialize_medoids(cost_matrix: np.ndarray, k: int, seed: int) -> list[int]:
+    """Deterministic farthest-first medoid initialization."""
+    rng = random.Random(seed)
+    n = cost_matrix.shape[0]
+    medoids = [rng.randrange(n)]
+
+    while len(medoids) < k:
+        nearest_cost = np.min(cost_matrix[:, medoids], axis=1)
+        nearest_cost[medoids] = -1.0
+        next_medoid = int(np.argmax(nearest_cost))
+        if next_medoid in medoids:
+            remaining = [i for i in range(n) if i not in medoids]
+            next_medoid = remaining[0]
+        medoids.append(next_medoid)
+
+    return medoids
+
+
+def balanced_assign_to_medoids(
+    cost_matrix: np.ndarray,
+    medoids: list[int],
+    target_sizes: list[int],
+) -> dict[int, list[int]]:
+    """
+    Assign each order to one medoid while keeping cluster sizes balanced.
+
+    Orders with a strong preference for one medoid are assigned first. This is a
+    practical constrained assignment heuristic for small delivery batches.
+    """
+    k = len(medoids)
+    clusters = {cluster_id: [] for cluster_id in range(k)}
+    assigned: set[int] = set()
+
+    preferences = []
+    for order_idx in range(cost_matrix.shape[0]):
+        ranked = sorted(
+            range(k),
+            key=lambda cluster_id: float(cost_matrix[order_idx, medoids[cluster_id]]),
+        )
+        best = float(cost_matrix[order_idx, medoids[ranked[0]]])
+        second = float(cost_matrix[order_idx, medoids[ranked[1]]]) if k > 1 else best
+        preferences.append((second - best, order_idx, ranked))
+
+    preferences.sort(reverse=True)
+    for _, order_idx, ranked_clusters in preferences:
+        for cluster_id in ranked_clusters:
+            if len(clusters[cluster_id]) < target_sizes[cluster_id]:
+                clusters[cluster_id].append(order_idx)
+                assigned.add(order_idx)
+                break
+
+    for order_idx in range(cost_matrix.shape[0]):
+        if order_idx in assigned:
+            continue
+        cluster_id = min(
+            range(k),
+            key=lambda cid: (
+                len(clusters[cid]) >= target_sizes[cid],
+                float(cost_matrix[order_idx, medoids[cid]]),
+            ),
+        )
+        clusters[cluster_id].append(order_idx)
+
+    return clusters
+
+
+def update_medoids(cost_matrix: np.ndarray, clusters: dict[int, list[int]]) -> list[int]:
+    medoids = []
+    for cluster_id in sorted(clusters):
+        members = clusters[cluster_id]
+        if not members:
+            medoids.append(0)
+            continue
+        best_member = min(
+            members,
+            key=lambda candidate: float(cost_matrix[candidate, members].sum()),
+        )
+        medoids.append(int(best_member))
+    return medoids
+
+
+def balanced_k_medoids(
+    cost_matrix: np.ndarray,
+    k: int,
+    seed: int = RANDOM_SEED,
+    max_iter: int = 30,
+) -> tuple[dict[int, list[int]], list[int], float]:
+    """
+    Balanced k-medoids over order-to-order travel-time costs.
+
+    Returns clusters of order indices, medoid order indices, and total intra-zone
+    travel-time cost.
+    """
+    if cost_matrix.shape[0] < k:
+        raise ValueError("Number of orders must be >= number of clusters.")
+
+    target_sizes = balanced_cluster_sizes(cost_matrix.shape[0], k)
+    medoids = initialize_medoids(cost_matrix, k, seed)
+    clusters = balanced_assign_to_medoids(cost_matrix, medoids, target_sizes)
+
+    for _ in range(max_iter):
+        new_medoids = update_medoids(cost_matrix, clusters)
+        new_clusters = balanced_assign_to_medoids(cost_matrix, new_medoids, target_sizes)
+        if new_medoids == medoids and new_clusters == clusters:
+            break
+        medoids = new_medoids
+        clusters = new_clusters
+
+    total_cost = 0.0
+    for cluster_id, members in clusters.items():
+        medoid = medoids[cluster_id]
+        total_cost += float(cost_matrix[members, medoid].sum())
+
+    return clusters, medoids, total_cost
+
+
+def part3_zone_division(G: nx.MultiDiGraph | None = None) -> dict[str, Any]:
+    print("\n" + "=" * 70)
+    print("PART 3 — ZONE DIVISION")
+    print("=" * 70)
+
+    data = load_json(OUTPUT_DIR / "delivery_nodes.json")
+    deliveries = data["deliveries"]
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+
+    coords = [(d["lat"], d["lon"]) for d in deliveries]
+    weights = [float(d["weight_kg"]) for d in deliveries]
+    order_time = clean_order_time_matrix(time_matrix)
+    zones, medoids, clustering_cost = balanced_k_medoids(
+        order_time,
+        N_SHIPPERS,
+        seed=RANDOM_SEED,
+    )
+
+    print(
+        "Balanced k-medoids: "
+        f"{len(deliveries)} orders -> {N_SHIPPERS} zones | "
+        f"target sizes={balanced_cluster_sizes(len(deliveries), N_SHIPPERS)} | "
+        f"cost={clustering_cost:.1f} min"
+    )
+
+    depots = data["depots"]
+    zone_summary = {}
+    for zone_id, members in zones.items():
+        lat = float(np.mean([coords[i][0] for i in members]))
+        lon = float(np.mean([coords[i][1] for i in members]))
+
+        depot_times = []
+        for depot in depots:
+            depot_idx = int(depot["matrix_index"])
+            member_matrix_indices = [order_idx_to_matrix_index(i) for i in members]
+            mean_time = float(np.mean(time_matrix[depot_idx, member_matrix_indices]))
+            depot_times.append((mean_time, depot["name"]))
+
+        nearest_depot = min(depot_times, key=lambda x: x[0])[1]
+        medoid_idx = medoids[zone_id]
+        medoid = deliveries[medoid_idx]
+        zone_summary[str(zone_id)] = {
+            "zone_id": zone_id,
+            "algorithm": "balanced_k_medoids",
+            "n_deliveries": len(members),
+            "delivery_indices": sorted(members),
+            "delivery_ids": [deliveries[i]["order_id"] for i in sorted(members)],
+            "medoid_order_index": medoid_idx,
+            "medoid_order_id": medoid["order_id"],
+            "medoid_lat": medoid["lat"],
+            "medoid_lon": medoid["lon"],
+            "centroid_lat": lat,
+            "centroid_lon": lon,
+            "total_weight_kg": round(sum(weights[i] for i in members), 1),
+            "intra_zone_time_cost_min": round(float(order_time[members, medoid_idx].sum()), 2),
+            "geohash_prefix": encode_geohash(lat, lon, precision=5),
+            "nearest_depot": nearest_depot,
+        }
+
+    save_json(OUTPUT_DIR / "zone_assignments.json", zone_summary)
+    visualize_part3_zones(zone_summary, data, G)
+    print(f"Saved {len(zone_summary)} zones")
+    return zone_summary
+
+
+def visualize_part3_zones(
+    zone_summary: dict[str, Any],
+    delivery_data: dict[str, Any],
+    G: nx.MultiDiGraph | None = None,
+) -> None:
+    """Visualize zone division as a static scatter map and an interactive map."""
+    print("\n[VIS] Part 3 zones...")
+
+    deliveries = delivery_data["deliveries"]
+    depots = delivery_data["depots"]
+
+    fig, ax = plt.subplots(figsize=(14, 14), dpi=180, facecolor="#f4efe7")
+    if G is not None:
+        plot_part1_detailed_base(
+            ax,
+            G,
+            "Part 3 - Zone Division on Part 1 Map",
+        )
+    else:
+        ax.set_facecolor("#f4efe7")
+
+    for zone_id_str, zone in zone_summary.items():
+        zone_id = int(zone_id_str)
+        color = MAP_COLORS[zone_id % len(MAP_COLORS)]
+        members = zone["delivery_indices"]
+
+        lats = [deliveries[i]["lat"] for i in members]
+        lons = [deliveries[i]["lon"] for i in members]
+        points = [(lon, lat) for lat, lon in zip(lats, lons)]
+
+        if len(points) >= 3:
+            hull = MultiPoint(points).convex_hull.buffer(0.002)
+            if hull.geom_type == "Polygon":
+                x, y = hull.exterior.xy
+                ax.fill(
+                    x,
+                    y,
+                    color=color,
+                    alpha=0.18,
+                    zorder=10,
+                )
+                ax.plot(
+                    x,
+                    y,
+                    color=color,
+                    linewidth=1.1,
+                    alpha=0.75,
+                    zorder=11,
+                )
+
+        ax.scatter(
+            lons,
+            lats,
+            s=42,
+            color=color,
+            alpha=0.9,
+            edgecolor="white",
+            linewidth=0.35,
+            zorder=30,
+        )
+
+        ax.text(
+            zone["centroid_lon"],
+            zone["centroid_lat"],
+            f"Z{zone_id}\n{len(members)} orders",
+            color="white",
+            fontsize=8,
+            ha="center",
+            va="center",
+            bbox={
+                "boxstyle": "round,pad=0.3",
+                "facecolor": color,
+                "alpha": 0.78,
+                "edgecolor": "none",
+            },
+            zorder=35,
+        )
+
+        if "medoid_lon" in zone and "medoid_lat" in zone:
+            ax.scatter(
+                zone["medoid_lon"],
+                zone["medoid_lat"],
+                s=95,
+                marker="X",
+                color=color,
+                edgecolor="#111827",
+                linewidth=0.6,
+                zorder=36,
+            )
+
+    for depot in depots:
+        ax.scatter(depot["lon"], depot["lat"], s=180, marker="*", color="#facc15", edgecolor="white", linewidth=1.0, zorder=40)
+        ax.text(depot["lon"], depot["lat"], depot["name"], color="#92400e", fontsize=9, fontweight="bold", zorder=41)
+
+    if G is None:
+        ax.set_title("Part 3 - Zone Division for Shipper Territories", color="#111827", fontsize=13, fontweight="bold")
+        ax.tick_params(colors="#6b7280", labelsize=7)
+        ax.grid(True, color="#cbd5e1", alpha=0.35, linewidth=0.4)
+    out_path = OUTPUT_DIR / "part3_zones.png"
+    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Static map: {out_path}")
+
+    if folium is None:
+        print("  Skipped part3_zones.html: folium is not installed")
+        return
+
+    if G is not None:
+        fmap = make_base_folium_map(G, "Part 3 - Zone Territories and Delivery Points")
+    else:
+        center = [
+            float(np.mean([d["lat"] for d in deliveries])),
+            float(np.mean([d["lon"] for d in deliveries])),
+        ]
+        fmap = folium.Map(location=center, zoom_start=14, tiles="cartodbpositron", control_scale=True)
+
+    for zone_id_str, zone in zone_summary.items():
+        zone_id = int(zone_id_str)
+        color = MAP_COLORS[zone_id % len(MAP_COLORS)]
+        group = folium.FeatureGroup(name=f"Zone {zone_id} ({zone['n_deliveries']} orders)", show=True)
+
+        members = zone["delivery_indices"]
+        points = [[deliveries[i]["lat"], deliveries[i]["lon"]] for i in members]
+        if len(points) >= 3:
+            try:
+
+                hull = MultiPoint([(lon, lat) for lat, lon in points]).convex_hull.buffer(0.002)
+                if hull.geom_type == "Polygon":
+                    hull_points = [(lat, lon) for lon, lat in hull.exterior.coords]
+                    folium.Polygon(
+                        hull_points,
+                        color=color,
+                        weight=2,
+                        fill=True,
+                        fill_opacity=0.13,
+                        tooltip=f"Zone {zone_id}",
+                    ).add_to(group)
+            except Exception:
+                pass
+
+        folium.CircleMarker(
+            [zone["centroid_lat"], zone["centroid_lon"]],
+            radius=8,
+            color=color,
+            fill=True,
+            fill_opacity=0.9,
+            tooltip=f"Zone {zone_id}: {zone['n_deliveries']} orders | {zone['total_weight_kg']}kg",
+        ).add_to(group)
+
+        if "medoid_lat" in zone and "medoid_lon" in zone:
+            folium.CircleMarker(
+                [zone["medoid_lat"], zone["medoid_lon"]],
+                radius=7,
+                color="#111827",
+                fill=True,
+                fill_color=color,
+                fill_opacity=0.95,
+                tooltip=f"Zone {zone_id} medoid: {zone.get('medoid_order_id', '')}",
+            ).add_to(group)
+
+        for idx in members:
+            delivery = deliveries[idx]
+            folium.CircleMarker(
+                [delivery["lat"], delivery["lon"]],
+                radius=4,
+                color=color,
+                fill=True,
+                fill_opacity=0.8,
+                tooltip=f"{delivery['order_id']} | {delivery['weight_kg']}kg | Zone {zone_id}",
+            ).add_to(group)
+        group.add_to(fmap)
+
+    for depot in depots:
+        folium.Marker(
+            [depot["lat"], depot["lon"]],
+            tooltip=depot["name"],
+            icon=folium.Icon(color="red", icon="home"),
+        ).add_to(fmap)
+
+    save_folium_map(fmap, "part3_zones.html")
+
+
+# =============================================================================
+# PART 4 — VRP OPTIMIZATION
+# =============================================================================
+
+@dataclass
+class Route:
+    shipper_id: int
+    depot_idx: int
+    stops: list[int]
+    load_kg: float
+
+    def full_path(self) -> list[int]:
+        return [self.depot_idx] + self.stops + [self.depot_idx]
+
+
+def route_travel_time(path: list[int], time_matrix: np.ndarray) -> float:
+    if len(path) < 2:
+        return 0.0
+    travel = sum(float(time_matrix[path[i], path[i + 1]]) for i in range(len(path) - 1))
+    service = max(0, len(path) - 2) * SERVICE_TIME_MIN
+    return travel + service
+
+
+def nearest_neighbor_route(
+    depot_idx: int,
+    candidates: list[int],
+    order_weights: dict[int, float],
+    time_matrix: np.ndarray,
+) -> tuple[list[int], list[int], float]:
+    remaining = set(candidates)
+    route = []
+    load = 0.0
+    current = depot_idx
+
+    while remaining:
+        feasible = [
+            stop for stop in remaining
+            if load + order_weights[stop] <= SHIPPER_CAPACITY_KG
+        ]
+        if not feasible:
+            break
+
+        best = min(feasible, key=lambda stop: float(time_matrix[current, stop]))
+        trial_path = [depot_idx] + route + [best] + [depot_idx]
+        if route_travel_time(trial_path, time_matrix) > SHIPPER_MAX_TIME_MIN:
+            break
+
+        route.append(best)
+        remaining.remove(best)
+        load += order_weights[best]
+        current = best
+
+    return route, sorted(remaining), load
+
+
+def two_opt(stops: list[int], depot_idx: int, time_matrix: np.ndarray) -> list[int]:
+    if len(stops) < 4:
+        return stops
+
+    best = stops[:]
+    best_cost = route_travel_time([depot_idx] + best + [depot_idx], time_matrix)
+    improved = True
+
+    while improved:
+        improved = False
+        for i in range(len(best) - 1):
+            for j in range(i + 2, len(best)):
+                candidate = best[:i] + best[i:j + 1][::-1] + best[j + 1:]
+                cost = route_travel_time([depot_idx] + candidate + [depot_idx], time_matrix)
+                if cost + 1e-6 < best_cost:
+                    best = candidate
+                    best_cost = cost
+                    improved = True
+                    break
+            if improved:
+                break
+    return best
+
+
+def part4_vrp_optimization(G: nx.MultiDiGraph | None = None) -> dict[str, Any]:
+    print("\n" + "=" * 70)
+    print("PART 4 — VRP OPTIMIZATION")
+    print("=" * 70)
+
+    delivery_data = load_json(OUTPUT_DIR / "delivery_nodes.json")
+    zone_data = load_json(OUTPUT_DIR / "zone_assignments.json")
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    dist_matrix = np.load(OUTPUT_DIR / "dist_matrix.npy")
+
+    deliveries = delivery_data["deliveries"]
+    depots = delivery_data["depots"]
+
+    order_weights = {
+        order_idx_to_matrix_index(i): float(deliveries[i]["weight_kg"])
+        for i in range(len(deliveries))
+    }
+
+    unassigned = set(order_idx_to_matrix_index(i) for i in range(len(deliveries)))
+    routes: list[Route] = []
+
+    for zone_id_str, zone in sorted(zone_data.items(), key=lambda item: int(item[0])):
+        zone_id = int(zone_id_str)
+        depot_name = zone["nearest_depot"]
+        depot_idx = next(
+            int(d["matrix_index"]) for d in depots if d["name"] == depot_name
+        )
+        candidates = [
+            order_idx_to_matrix_index(i)
+            for i in zone["delivery_indices"]
+            if order_idx_to_matrix_index(i) in unassigned
+        ]
+
+        stops, leftover, load = nearest_neighbor_route(
+            depot_idx,
+            candidates,
+            order_weights,
+            time_matrix,
+        )
+        stops = two_opt(stops, depot_idx, time_matrix)
+        for stop in stops:
+            unassigned.discard(stop)
+
+        routes.append(Route(zone_id, depot_idx, stops, load))
+
+    # Try to insert unassigned orders into the cheapest feasible route.
+    for stop in list(unassigned):
+        weight = order_weights[stop]
+        best_move = None
+        for route_idx, route in enumerate(routes):
+            if route.load_kg + weight > SHIPPER_CAPACITY_KG:
+                continue
+            for pos in range(len(route.stops) + 1):
+                candidate_stops = route.stops[:pos] + [stop] + route.stops[pos:]
+                candidate_path = [route.depot_idx] + candidate_stops + [route.depot_idx]
+                candidate_time = route_travel_time(candidate_path, time_matrix)
+                if candidate_time > SHIPPER_MAX_TIME_MIN:
+                    continue
+                old_time = route_travel_time(route.full_path(), time_matrix)
+                delta = candidate_time - old_time
+                if best_move is None or delta < best_move[0]:
+                    best_move = (delta, route_idx, pos)
+        if best_move:
+            _, route_idx, pos = best_move
+            routes[route_idx].stops.insert(pos, stop)
+            routes[route_idx].load_kg += weight
+            unassigned.discard(stop)
+
+    schedule = []
+    for offset, route in enumerate(sorted(routes, key=lambda r: len(r.stops), reverse=True)):
+        path = route.full_path()
+        travel_time = route_travel_time(path, time_matrix)
+        travel_dist = sum(float(dist_matrix[path[i], path[i + 1]]) for i in range(len(path) - 1))
+        schedule.append(
+            {
+                "shipper_id": route.shipper_id,
+                "depot_idx": route.depot_idx,
+                "depot_name": depots[route.depot_idx]["name"],
+                "departure": f"{WORKING_START_HOUR:02d}:{offset * 5:02d}",
+                "n_stops": len(route.stops),
+                "load_kg": round(route.load_kg, 1),
+                "total_time_min": round(travel_time, 1),
+                "total_distance_km": round(travel_dist, 2),
+                "feasible": route.load_kg <= SHIPPER_CAPACITY_KG and travel_time <= SHIPPER_MAX_TIME_MIN,
+                "route_stops": path,
+                "order_ids": [
+                    deliveries[matrix_index_to_order_idx(stop)]["order_id"]
+                    for stop in route.stops
+                ],
+            }
+        )
+
+    solution = {
+        "metadata": {
+            "algorithm": "Zone assignment + nearest neighbor + 2-opt + cheapest insertion",
+            "n_depots": N_DEPOTS,
+            "n_shippers": len(routes),
+            "n_orders": len(deliveries),
+            "assigned_orders": len(deliveries) - len(unassigned),
+            "unassigned_orders": len(unassigned),
+            "total_time_min": round(sum(s["total_time_min"] for s in schedule), 1),
+            "total_distance_km": round(sum(s["total_distance_km"] for s in schedule), 2),
+            "shipper_capacity_kg": SHIPPER_CAPACITY_KG,
+            "shipper_max_time_min": SHIPPER_MAX_TIME_MIN,
+        },
+        "schedule": schedule,
+        "unassigned_orders": [
+            {
+                "order_index": matrix_index_to_order_idx(stop),
+                "order_id": deliveries[matrix_index_to_order_idx(stop)]["order_id"],
+            }
+            for stop in sorted(unassigned)
+        ],
+    }
+    save_json(OUTPUT_DIR / "vrp_solution.json", solution)
+    if G is not None:
+        visualize_part4_vrp_routes(G, solution, delivery_data)
+    print(
+        f"Assigned {solution['metadata']['assigned_orders']}/{len(deliveries)} orders | "
+        f"unassigned={len(unassigned)}"
+    )
+    return solution
+
+
+def matrix_route_to_graph_route(G: nx.MultiDiGraph, matrix_route: list[int]) -> list[Any]:
+    """Convert a depot/order matrix route into a continuous graph-node route."""
+    graph_route: list[str] = []
+    for src_idx, dst_idx in zip(matrix_route[:-1], matrix_route[1:]):
+        src = graph_node_from_matrix_index(src_idx)
+        dst = graph_node_from_matrix_index(dst_idx)
+        segment = shortest_node_route(G, src, dst)
+        if not segment:
+            continue
+        if graph_route:
+            segment = segment[1:]
+        graph_route.extend(segment)
+    return graph_route
+
+
+def visualize_part4_vrp_routes(
+    G: nx.MultiDiGraph,
+    solution: dict[str, Any],
+    delivery_data: dict[str, Any],
+) -> None:
+    """Visualize final optimized VRP routes as static and interactive maps."""
+    print("\n[VIS] Part 4 VRP routes...")
+
+    depots = delivery_data["depots"]
+    deliveries = delivery_data["deliveries"]
+    route_paths = []
+    for route in solution["schedule"]:
+        graph_route = matrix_route_to_graph_route(G, route["route_stops"])
+        latlon = route_latlon_path(G, graph_route) if graph_route else []
+        route_paths.append((route, graph_route, latlon))
+
+    fig, ax = plt.subplots(figsize=(15, 15), dpi=180, facecolor="#f4efe7")
+    plot_part1_detailed_base(
+        ax,
+        G,
+        "Part 4 - Optimized VRP Routes on Part 1 Map",
+    )
+
+    for route, _, latlon in route_paths:
+        color = MAP_COLORS[int(route["shipper_id"]) % len(MAP_COLORS)]
+        if len(latlon) >= 2:
+            lats = [p[0] for p in latlon]
+            lons = [p[1] for p in latlon]
+            ax.plot(lons, lats, color=color, linewidth=2.0, alpha=0.82, zorder=25)
+
+        stop_orders = [idx for idx in route["route_stops"][1:-1] if idx >= N_DEPOTS]
+        ax.scatter(
+            [deliveries[matrix_index_to_order_idx(idx)]["lon"] for idx in stop_orders],
+            [deliveries[matrix_index_to_order_idx(idx)]["lat"] for idx in stop_orders],
+            s=26,
+            color=color,
+            edgecolor="white",
+            linewidth=0.35,
+            zorder=30,
+        )
+
+    for depot in depots:
+        ax.scatter(depot["lon"], depot["lat"], s=160, marker="s", color="#111827", edgecolor="white", zorder=40)
+        ax.text(depot["lon"], depot["lat"], depot["name"], fontsize=8, color="#111827", fontweight="bold", zorder=41)
+
+    out_path = OUTPUT_DIR / "part4_vrp_routes.png"
+    fig.savefig(out_path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Static map: {out_path}")
+
+    fmap = make_base_folium_map(G, "Part 4 - Optimized VRP Routes")
+    if fmap is not None:
+        for route, _, latlon in route_paths:
+            shipper_id = int(route["shipper_id"])
+            color = MAP_COLORS[shipper_id % len(MAP_COLORS)]
+            group = folium.FeatureGroup(
+                name=f"Shipper {shipper_id}: {route['n_stops']} stops, {route['total_time_min']} min",
+                show=True,
+            )
+            if len(latlon) >= 2:
+                folium.PolyLine(
+                    latlon,
+                    color=color,
+                    weight=4,
+                    opacity=0.82,
+                    tooltip=(
+                        f"Shipper {shipper_id} | {route['n_stops']} stops | "
+                        f"{route['total_time_min']} min | {route['total_distance_km']} km"
+                    ),
+                ).add_to(group)
+
+            for leg_seq, (src_idx, dst_idx) in enumerate(
+                zip(route["route_stops"][:-1], route["route_stops"][1:]),
+                start=1,
+            ):
+                leg_graph_route = matrix_route_to_graph_route(G, [src_idx, dst_idx])
+                leg_latlon = route_latlon_path(G, leg_graph_route) if leg_graph_route else []
+                if len(leg_latlon) < 2:
+                    continue
+
+                if dst_idx < N_DEPOTS:
+                    leg_label = "return depot"
+                else:
+                    order = deliveries[matrix_index_to_order_idx(dst_idx)]
+                    leg_label = order["order_id"]
+
+                folium.PolyLine(
+                    leg_latlon,
+                    color=color,
+                    weight=6,
+                    opacity=0.38,
+                    tooltip=f"S{shipper_id} leg {leg_seq}: {leg_label}",
+                ).add_to(group)
+
+            depot = depots[int(route["depot_idx"])]
+            folium.Marker(
+                [depot["lat"], depot["lon"]],
+                tooltip=f"Start/End: {depot['name']}",
+                icon=folium.Icon(color="red", icon="home"),
+            ).add_to(group)
+
+            for seq, matrix_idx in enumerate(route["route_stops"][1:-1], start=1):
+                if matrix_idx < N_DEPOTS:
+                    continue
+                order = deliveries[matrix_index_to_order_idx(matrix_idx)]
+                folium.CircleMarker(
+                    [order["lat"], order["lon"]],
+                    radius=4,
+                    color=color,
+                    fill=True,
+                    fill_opacity=0.88,
+                    tooltip=f"#{seq} {order['order_id']} | {order['weight_kg']}kg | S{shipper_id}",
+                ).add_to(group)
+                folium.Marker(
+                    [order["lat"], order["lon"]],
+                    icon=folium.DivIcon(
+                        html=(
+                            f"<div style='background:{color}; color:white; border:1px solid white; "
+                            f"border-radius:50%; width:20px; height:20px; line-height:20px; "
+                            f"text-align:center; font-size:11px; font-weight:700;'>{seq}</div>"
+                        )
+                    ),
+                    tooltip=f"Stop {seq}: {order['order_id']}",
+                ).add_to(group)
+            group.add_to(fmap)
+
+        unassigned_group = folium.FeatureGroup(name="Unassigned orders", show=True)
+        for item in solution["unassigned_orders"]:
+            order = deliveries[int(item["order_index"])]
+            folium.CircleMarker(
+                [order["lat"], order["lon"]],
+                radius=5,
+                color="#111827",
+                fill=True,
+                fill_color="#ef4444",
+                fill_opacity=0.95,
+                tooltip=f"Unassigned: {order['order_id']}",
+            ).add_to(unassigned_group)
+        unassigned_group.add_to(fmap)
+
+    save_folium_map(fmap, "part4_vrp_routes.html")
+
+
+# =============================================================================
+# PART 5 — SIMULATION & DASHBOARD
+# =============================================================================
+
+PRESENTATION_DIR = OUTPUT_DIR / "presentation_visuals"
+
+
+def ensure_presentation_dir() -> None:
+    PRESENTATION_DIR.mkdir(exist_ok=True)
+
+
+def save_presentation_figure(fig: Any, filename: str) -> None:
+    ensure_presentation_dir()
+    path = PRESENTATION_DIR / filename
+    fig.savefig(path, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    print(f"  Slide visual: {path}")
+
+
+def plot_delivery_points(
+    ax: Any,
+    delivery_data: dict[str, Any],
+    zone_summary: dict[str, Any] | None = None,
+    show_labels: bool = True,
+) -> None:
+    depots = delivery_data["depots"]
+    deliveries = delivery_data["deliveries"]
+
+    if zone_summary is None:
+        ax.scatter(
+            [d["lon"] for d in deliveries],
+            [d["lat"] for d in deliveries],
+            s=22,
+            color="#f97316",
+            edgecolor="white",
+            linewidth=0.35,
+            alpha=0.92,
+            zorder=30,
+        )
+    else:
+        for zone_id_str, zone in zone_summary.items():
+            zone_id = int(zone_id_str)
+            color = MAP_COLORS[zone_id % len(MAP_COLORS)]
+            members = zone["delivery_indices"]
+            lons = [deliveries[i]["lon"] for i in members]
+            lats = [deliveries[i]["lat"] for i in members]
+            points = list(zip(lons, lats))
+
+            if len(points) >= 3:
+                hull = MultiPoint(points).convex_hull.buffer(0.002)
+                if hull.geom_type == "Polygon":
+                    x, y = hull.exterior.xy
+                    ax.fill(x, y, color=color, alpha=0.16, zorder=10)
+                    ax.plot(x, y, color=color, linewidth=1.0, alpha=0.72, zorder=11)
+
+            ax.scatter(
+                lons,
+                lats,
+                s=30,
+                color=color,
+                edgecolor="white",
+                linewidth=0.35,
+                alpha=0.92,
+                zorder=30,
+            )
+            ax.scatter(
+                zone["centroid_lon"],
+                zone["centroid_lat"],
+                s=95,
+                marker="X",
+                color=color,
+                edgecolor="#111827",
+                linewidth=0.5,
+                zorder=35,
+            )
+            if show_labels:
+                ax.text(
+                    zone["centroid_lon"],
+                    zone["centroid_lat"],
+                    f"Z{zone_id}",
+                    color="#111827",
+                    fontsize=8,
+                    fontweight="bold",
+                    ha="center",
+                    va="bottom",
+                    zorder=36,
+                )
+
+    for depot in depots:
+        ax.scatter(
+            depot["lon"],
+            depot["lat"],
+            s=150,
+            marker="s",
+            color="#111827",
+            edgecolor="white",
+            linewidth=0.8,
+            zorder=40,
+        )
+        if show_labels:
+            ax.text(
+                depot["lon"],
+                depot["lat"],
+                depot["name"],
+                fontsize=8,
+                color="#111827",
+                fontweight="bold",
+                zorder=41,
+            )
+
+
+def build_raw_graph_for_visual() -> nx.MultiDiGraph | None:
+    try:
+        return ox.graph_from_place(
+            PLACE,
+            network_type="all",
+            simplify=True,
+            retain_all=False,
+            truncate_by_edge=True,
+        )
+    except Exception as exc:
+        print(f"  Skipped raw graph panel: {exc}")
+        return None
+
+
+def visualize_cleaning_graph(G: nx.MultiDiGraph) -> None:
+    print("\n[SLIDES] 01 graph cleaning...")
+    raw = build_raw_graph_for_visual()
+    if raw is None:
+        return
+
+    cleaned_edges = set((str(u), str(v), str(k)) for u, v, k in G.edges(keys=True))
+    raw_edges = ox.graph_to_gdfs(raw, nodes=False, edges=True).reset_index()
+    clean_edges = ox.graph_to_gdfs(G, nodes=False, edges=True).reset_index()
+
+    raw_edges["_edge_id"] = raw_edges.apply(
+        lambda row: (str(row["u"]), str(row["v"]), str(row["key"])),
+        axis=1,
+    )
+    removed_edges = raw_edges[~raw_edges["_edge_id"].isin(cleaned_edges)]
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 9), dpi=180, facecolor="#f4efe7")
+    for ax in axes:
+        ax.set_facecolor("#f4efe7")
+        ax.set_axis_off()
+
+    raw_edges.plot(ax=axes[0], color="#9ca3af", linewidth=0.45, alpha=0.55)
+    if len(removed_edges) > 0:
+        removed_edges.plot(ax=axes[0], color="#ef4444", linewidth=0.85, alpha=0.9)
+    axes[0].set_title(
+        f"Raw OSM graph\n{raw.number_of_nodes():,} nodes | {raw.number_of_edges():,} edges",
+        fontsize=13,
+        fontweight="bold",
+        loc="left",
+    )
+
+    clean_edges.plot(ax=axes[1], color="#111827", linewidth=0.45, alpha=0.75)
+    axes[1].set_title(
+        f"Cleaned logistics graph\n{G.number_of_nodes():,} nodes | {G.number_of_edges():,} edges",
+        fontsize=13,
+        fontweight="bold",
+        loc="left",
+    )
+    save_presentation_figure(fig, "01_graph_cleaning_raw_vs_cleaned.png")
+
+
+def visualize_weight_maps(G: nx.MultiDiGraph) -> None:
+    print("\n[SLIDES] 02 edge weights...")
+    edges = ox.graph_to_gdfs(G, nodes=False, edges=True)
+    weights = [
+        ("weight_distance", "Distance weight (km)"),
+        ("weight_time", "Time weight (min)"),
+        ("weight_congestion", "Congestion-adjusted time"),
+        ("weight_logistics", "Composite logistics cost"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(15, 15), dpi=170, facecolor="#f4efe7")
+    for ax, (column, title) in zip(axes.flat, weights):
+        ax.set_facecolor("#f4efe7")
+        edges.plot(
+            ax=ax,
+            column=column,
+            cmap="viridis_r",
+            linewidth=1.0,
+            alpha=0.95,
+            legend=True,
+            legend_kwds={"shrink": 0.72},
+        )
+        ax.set_title(title, fontsize=12, fontweight="bold", loc="left")
+        ax.set_axis_off()
+    save_presentation_figure(fig, "02_edge_weight_heatmaps.png")
+
+
+def visualize_base_map_for_slides(G: nx.MultiDiGraph) -> None:
+    print("\n[SLIDES] 03 base map...")
+    fig, ax = plt.subplots(figsize=(14, 14), dpi=180, facecolor="#f4efe7")
+    plot_part1_detailed_base(ax, G, "Base GIS Map for Routing Overlays")
+    save_presentation_figure(fig, "03_base_map.png")
+
+
+def visualize_depots_orders(G: nx.MultiDiGraph, delivery_data: dict[str, Any]) -> None:
+    print("\n[SLIDES] 04 depots and orders...")
+    fig, ax = plt.subplots(figsize=(14, 14), dpi=180, facecolor="#f4efe7")
+    plot_part1_detailed_base(ax, G, "Generated Depots and Delivery Orders")
+    plot_delivery_points(ax, delivery_data)
+    save_presentation_figure(fig, "04_depots_and_orders.png")
+
+
+def visualize_shortest_path_examples(G: nx.MultiDiGraph, delivery_data: dict[str, Any]) -> None:
+    print("\n[SLIDES] 05 shortest path examples...")
+    depots = delivery_data["depots"]
+    deliveries = delivery_data["deliveries"]
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+
+    examples = []
+    for depot in depots:
+        depot_idx = int(depot["matrix_index"])
+        ranked = sorted(
+            deliveries,
+            key=lambda d: float(time_matrix[depot_idx, int(d["matrix_index"])]),
+        )
+        for delivery in ranked:
+            route_nodes = shortest_node_route(G, depot["node_id"], delivery["node_id"])
+            if route_nodes:
+                examples.append((depot, delivery, route_nodes))
+                break
+
+    fig, ax = plt.subplots(figsize=(14, 14), dpi=180, facecolor="#f4efe7")
+    plot_part1_detailed_base(ax, G, "Shortest Routes on Road Graph")
+    for idx, (depot, delivery, route_nodes) in enumerate(examples):
+        color = MAP_COLORS[idx % len(MAP_COLORS)]
+        path = route_latlon_path(G, route_nodes)
+        if len(path) >= 2:
+            lats = [p[0] for p in path]
+            lons = [p[1] for p in path]
+            ax.plot(
+                [depot["lon"], delivery["lon"]],
+                [depot["lat"], delivery["lat"]],
+                color=color,
+                linestyle="--",
+                linewidth=1.0,
+                alpha=0.45,
+                zorder=21,
+            )
+            ax.plot(lons, lats, color=color, linewidth=3.0, alpha=0.9, zorder=25)
+        ax.scatter(depot["lon"], depot["lat"], s=130, marker="s", color=color, edgecolor="white", zorder=31)
+        ax.scatter(delivery["lon"], delivery["lat"], s=90, marker="o", color=color, edgecolor="white", zorder=31)
+    save_presentation_figure(fig, "05_shortest_path_examples.png")
+
+
+def visualize_time_distance_matrices() -> None:
+    print("\n[SLIDES] 06 time and distance matrices...")
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    dist_matrix = np.load(OUTPUT_DIR / "dist_matrix.npy")
+    matrices = [
+        (dist_matrix, "Distance Matrix (km)", "Distance, km"),
+        (time_matrix, "Time Matrix (min)", "Travel time, min"),
+    ]
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7), dpi=180, facecolor="white")
+    for ax, (matrix, title, label) in zip(axes, matrices):
+        data = np.where(matrix >= UNREACHABLE, np.nan, matrix)
+        image = ax.imshow(data, cmap="magma_r", interpolation="nearest")
+        ax.set_title(title, fontsize=13, fontweight="bold", loc="left")
+        ax.set_xlabel("Destination: depots + orders")
+        ax.set_ylabel("Origin: depots + orders")
+        fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label=label)
+    save_presentation_figure(fig, "06_time_distance_matrices.png")
+
+
+def visualize_order_to_order_matrix() -> None:
+    print("\n[SLIDES] 07 order-to-order matrix...")
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    order_matrix = time_matrix[N_DEPOTS:, N_DEPOTS:]
+    data = np.where(order_matrix >= UNREACHABLE, np.nan, order_matrix)
+
+    fig, ax = plt.subplots(figsize=(9, 8), dpi=180, facecolor="white")
+    image = ax.imshow(data, cmap="cubehelix_r", interpolation="nearest")
+    ax.set_title("Order-to-Order Travel Time Matrix", fontsize=13, fontweight="bold", loc="left")
+    ax.set_xlabel("Destination order")
+    ax.set_ylabel("Origin order")
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label="Travel time, min")
+    save_presentation_figure(fig, "07_order_to_order_time_matrix.png")
+
+
+def visualize_balanced_zones(
+    G: nx.MultiDiGraph,
+    delivery_data: dict[str, Any],
+    zone_summary: dict[str, Any],
+) -> None:
+    print("\n[SLIDES] 08 balanced zones...")
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(18, 9),
+        dpi=180,
+        facecolor="#f4efe7",
+        gridspec_kw={"width_ratios": [1.45, 0.75]},
+    )
+    plot_part1_detailed_base(axes[0], G, "Balanced Zone Assignment")
+    plot_delivery_points(axes[0], delivery_data, zone_summary)
+
+    zone_ids = [int(z) for z in zone_summary.keys()]
+    counts = [zone_summary[str(z)]["n_deliveries"] for z in zone_ids]
+    weights = [zone_summary[str(z)]["total_weight_kg"] for z in zone_ids]
+    colors = [MAP_COLORS[z % len(MAP_COLORS)] for z in zone_ids]
+    x = np.arange(len(zone_ids))
+
+    axes[1].bar(x - 0.18, counts, width=0.36, color=colors, alpha=0.9, label="Orders")
+    axes[1].bar(x + 0.18, weights, width=0.36, color="#111827", alpha=0.72, label="Weight kg")
+    axes[1].set_title("Zone Balance", fontsize=13, fontweight="bold", loc="left")
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels([f"Z{z}" for z in zone_ids])
+    axes[1].grid(axis="y", color="#d1d5db", linewidth=0.6, alpha=0.7)
+    axes[1].legend()
+    save_presentation_figure(fig, "08_balanced_zone_assignment.png")
+
+
+def select_demo_route(solution: dict[str, Any]) -> dict[str, Any] | None:
+    candidates = [r for r in solution["schedule"] if len(r["route_stops"]) >= 5]
+    if not candidates:
+        candidates = solution["schedule"]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda r: len(r["route_stops"]))
+
+
+def plot_matrix_route_arrows(
+    ax: Any,
+    delivery_data: dict[str, Any],
+    matrix_route: list[int],
+    color: str,
+    linewidth: float = 2.0,
+    alpha: float = 0.9,
+    label_steps: bool = False,
+) -> None:
+    depots = delivery_data["depots"]
+    deliveries = delivery_data["deliveries"]
+
+    def coords(matrix_idx: int) -> tuple[float, float]:
+        if matrix_idx < N_DEPOTS:
+            point = depots[matrix_idx]
+        else:
+            point = deliveries[matrix_index_to_order_idx(matrix_idx)]
+        return float(point["lon"]), float(point["lat"])
+
+    for seq, (src, dst) in enumerate(zip(matrix_route[:-1], matrix_route[1:]), start=1):
+        x1, y1 = coords(src)
+        x2, y2 = coords(dst)
+        ax.annotate(
+            "",
+            xy=(x2, y2),
+            xytext=(x1, y1),
+            arrowprops={
+                "arrowstyle": "->",
+                "color": color,
+                "lw": linewidth,
+                "alpha": alpha,
+                "shrinkA": 5,
+                "shrinkB": 5,
+            },
+            zorder=45,
+        )
+        if label_steps and dst >= N_DEPOTS:
+            ax.text(
+                x2,
+                y2,
+                str(seq),
+                fontsize=7,
+                color="white",
+                ha="center",
+                va="center",
+                bbox={"boxstyle": "circle,pad=0.2", "facecolor": color, "edgecolor": "white", "linewidth": 0.4},
+                zorder=50,
+            )
+
+
+def visualize_nearest_neighbor_demo(
+    G: nx.MultiDiGraph,
+    delivery_data: dict[str, Any],
+    solution: dict[str, Any],
+) -> None:
+    print("\n[SLIDES] 09 nearest neighbor demo...")
+    route = select_demo_route(solution)
+    if route is None:
+        return
+
+    matrix_route = route["route_stops"][: min(len(route["route_stops"]), 9)]
+    if matrix_route[-1] != route["depot_idx"]:
+        matrix_route.append(route["depot_idx"])
+
+    fig, ax = plt.subplots(figsize=(14, 14), dpi=180, facecolor="#f4efe7")
+    plot_part1_detailed_base(ax, G, "Nearest Neighbor Route Construction")
+    plot_delivery_points(ax, delivery_data, show_labels=False)
+    plot_matrix_route_arrows(ax, delivery_data, matrix_route, "#2563eb", linewidth=2.2, label_steps=True)
+    save_presentation_figure(fig, "09_nearest_neighbor_construction.png")
+
+
+def find_two_opt_demo(route: dict[str, Any], time_matrix: np.ndarray) -> tuple[list[int], list[int]]:
+    depot_idx = int(route["depot_idx"])
+    optimized = [idx for idx in route["route_stops"][1:-1] if idx >= N_DEPOTS]
+    if len(optimized) < 4:
+        return optimized, optimized
+
+    shuffled = optimized[:]
+    shuffled[1:4] = reversed(shuffled[1:4])
+    improved = two_opt(shuffled, depot_idx, time_matrix)
+    if improved == shuffled:
+        shuffled = optimized[::-1]
+        improved = two_opt(shuffled, depot_idx, time_matrix)
+    return shuffled, improved
+
+
+def visualize_two_opt_demo(
+    G: nx.MultiDiGraph,
+    delivery_data: dict[str, Any],
+    solution: dict[str, Any],
+) -> None:
+    print("\n[SLIDES] 10 2-opt demo...")
+    route = select_demo_route(solution)
+    if route is None:
+        return
+
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    depot_idx = int(route["depot_idx"])
+    before_stops, after_stops = find_two_opt_demo(route, time_matrix)
+    before_route = [depot_idx] + before_stops + [depot_idx]
+    after_route = [depot_idx] + after_stops + [depot_idx]
+
+    fig, axes = plt.subplots(1, 2, figsize=(18, 9), dpi=180, facecolor="#f4efe7")
+    for ax, matrix_route, title, color in [
+        (axes[0], before_route, f"Before 2-opt: {route_travel_time(before_route, time_matrix):.1f} min", "#ef4444"),
+        (axes[1], after_route, f"After 2-opt: {route_travel_time(after_route, time_matrix):.1f} min", "#16a34a"),
+    ]:
+        plot_part1_detailed_base(ax, G, title)
+        plot_delivery_points(ax, delivery_data, show_labels=False)
+        plot_matrix_route_arrows(ax, delivery_data, matrix_route, color, linewidth=2.0, label_steps=True)
+    save_presentation_figure(fig, "10_two_opt_before_after.png")
+
+
+def visualize_cheapest_insertion_demo(
+    G: nx.MultiDiGraph,
+    delivery_data: dict[str, Any],
+    solution: dict[str, Any],
+) -> None:
+    print("\n[SLIDES] 11 cheapest insertion demo...")
+    route = select_demo_route(solution)
+    if route is None or len(route["route_stops"]) < 5:
+        return
+
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    full_route = route["route_stops"]
+    base_route = full_route[:-2] + [full_route[-1]]
+    inserted = full_route[-2]
+
+    best_pos = None
+    best_delta = float("inf")
+    for pos in range(len(base_route) - 1):
+        src = base_route[pos]
+        dst = base_route[pos + 1]
+        delta = float(time_matrix[src, inserted] + time_matrix[inserted, dst] - time_matrix[src, dst])
+        if delta < best_delta:
+            best_delta = delta
+            best_pos = pos
+
+    inserted_route = base_route[: best_pos + 1] + [inserted] + base_route[best_pos + 1 :]
+
+    fig, ax = plt.subplots(figsize=(14, 14), dpi=180, facecolor="#f4efe7")
+    plot_part1_detailed_base(ax, G, "Cheapest Insertion for Leftover Order")
+    plot_delivery_points(ax, delivery_data, show_labels=False)
+    plot_matrix_route_arrows(ax, delivery_data, base_route, "#2563eb", linewidth=1.7, alpha=0.65)
+    plot_matrix_route_arrows(ax, delivery_data, inserted_route, "#16a34a", linewidth=2.5, alpha=0.9)
+
+    order = delivery_data["deliveries"][matrix_index_to_order_idx(inserted)]
+    ax.scatter(
+        order["lon"],
+        order["lat"],
+        s=160,
+        marker="*",
+        color="#ef4444",
+        edgecolor="white",
+        linewidth=0.8,
+        zorder=55,
+    )
+    ax.text(
+        order["lon"],
+        order["lat"],
+        f"+{best_delta:.1f} min",
+        fontsize=9,
+        color="#111827",
+        fontweight="bold",
+        zorder=56,
+    )
+    save_presentation_figure(fig, "11_cheapest_insertion.png")
+
+
+def save_presentation_manifest() -> None:
+    ensure_presentation_dir()
+    files = sorted(path.name for path in PRESENTATION_DIR.glob("*.png"))
+    manifest = {
+        "presentation_visuals": files,
+        "output_dir": str(PRESENTATION_DIR.resolve()),
+    }
+    save_json(PRESENTATION_DIR / "manifest.json", manifest)
+
+
+def create_presentation_visuals(
+    G: nx.MultiDiGraph,
+    delivery_data: dict[str, Any],
+    zone_summary: dict[str, Any],
+    solution: dict[str, Any],
+) -> None:
+    print("\n" + "=" * 70)
+    print("PRESENTATION VISUALS - EXPORTING 11 SLIDE-READY PNGS")
+    print("=" * 70)
+    ensure_presentation_dir()
+    visualize_cleaning_graph(G)
+    visualize_weight_maps(G)
+    visualize_base_map_for_slides(G)
+    visualize_depots_orders(G, delivery_data)
+    visualize_shortest_path_examples(G, delivery_data)
+    visualize_time_distance_matrices()
+    visualize_order_to_order_matrix()
+    visualize_balanced_zones(G, delivery_data, zone_summary)
+    visualize_nearest_neighbor_demo(G, delivery_data, solution)
+    visualize_two_opt_demo(G, delivery_data, solution)
+    visualize_cheapest_insertion_demo(G, delivery_data, solution)
+    save_presentation_manifest()
+    print(f"Presentation visuals saved in: {PRESENTATION_DIR.resolve()}")
+
+
+def parse_departure_minutes(value: str) -> float:
+    hour, minute = value.split(":")
+    return (int(hour) - WORKING_START_HOUR) * 60 + int(minute)
+
+
+def part5_simulation_dashboard() -> dict[str, Any]:
+    print("\n" + "=" * 70)
+    print("PART 5 — SIMULATION & DASHBOARD")
+    print("=" * 70)
+
+    solution = load_json(OUTPUT_DIR / "vrp_solution.json")
+    delivery_data = load_json(OUTPUT_DIR / "delivery_nodes.json")
+    time_matrix = np.load(OUTPUT_DIR / "time_matrix.npy")
+    deliveries = delivery_data["deliveries"]
+
+    events = []
+    delivered = 0
+
+    for route in solution["schedule"]:
+        shipper_id = route["shipper_id"]
+        path = route["route_stops"]
+        current_time = parse_departure_minutes(route["departure"])
+
+        events.append(
+            {
+                "time_min": round(current_time, 1),
+                "clock": minutes_to_clock(current_time),
+                "type": "DEPART",
+                "shipper_id": shipper_id,
+                "location": route["depot_name"],
+            }
+        )
+
+        for i in range(len(path) - 1):
+            src = path[i]
+            dst = path[i + 1]
+            travel = float(time_matrix[src, dst])
+            current_time += travel
+
+            if dst >= N_DEPOTS:
+                order_idx = matrix_index_to_order_idx(dst)
+                delivered += 1
+                events.append(
+                    {
+                        "time_min": round(current_time, 1),
+                        "clock": minutes_to_clock(current_time),
+                        "type": "ARRIVE_ORDER",
+                        "shipper_id": shipper_id,
+                        "order_id": deliveries[order_idx]["order_id"],
+                    }
+                )
+                current_time += SERVICE_TIME_MIN
+                events.append(
+                    {
+                        "time_min": round(current_time, 1),
+                        "clock": minutes_to_clock(current_time),
+                        "type": "DELIVERED",
+                        "shipper_id": shipper_id,
+                        "order_id": deliveries[order_idx]["order_id"],
+                    }
+                )
+            else:
+                events.append(
+                    {
+                        "time_min": round(current_time, 1),
+                        "clock": minutes_to_clock(current_time),
+                        "type": "RETURN_DEPOT",
+                        "shipper_id": shipper_id,
+                        "location": route["depot_name"],
+                    }
+                )
+
+    events.sort(key=lambda event: event["time_min"])
+    summary = {
+        "total_events": len(events),
+        "delivered_orders": delivered,
+        "unassigned_orders": len(solution["unassigned_orders"]),
+        "total_time_min": solution["metadata"]["total_time_min"],
+        "total_distance_km": solution["metadata"]["total_distance_km"],
+        "active_shippers": len(solution["schedule"]),
+    }
+
+    save_json(OUTPUT_DIR / "simulation_events.json", events)
+    save_json(OUTPUT_DIR / "simulation_summary.json", summary)
+    save_dashboard_html(solution, summary, events)
+    print(f"Saved simulation with {len(events)} events")
+    return summary
+
+
+def minutes_to_clock(minutes_from_start: float) -> str:
+    total = WORKING_START_HOUR * 60 + int(round(minutes_from_start))
+    return f"{(total // 60) % 24:02d}:{total % 60:02d}"
+
+
+def save_dashboard_html(solution: dict[str, Any], summary: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    rows = "\n".join(
+        f"""
+        <tr>
+          <td>S{r['shipper_id']}</td>
+          <td>{r['depot_name']}</td>
+          <td>{r['departure']}</td>
+          <td>{r['n_stops']}</td>
+          <td>{r['load_kg']}</td>
+          <td>{r['total_time_min']}</td>
+          <td>{r['total_distance_km']}</td>
+          <td>{'OK' if r['feasible'] else 'Check'}</td>
+        </tr>
+        """
+        for r in solution["schedule"]
+    )
+    event_rows = "\n".join(
+        f"<tr><td>{e['clock']}</td><td>{e['type']}</td><td>S{e['shipper_id']}</td><td>{e.get('order_id', e.get('location', ''))}</td></tr>"
+        for e in events[:300]
+    )
+    dsa_section = ""
+    dsa_summary_path = DSA_OUTPUT_DIR / "00_dsa_upgrade_summary.csv"
+    if dsa_summary_path.exists():
+        try:
+            dsa_summary = pd.read_csv(dsa_summary_path)
+            dsa_rows = "\n".join(
+                f"""
+                <tr>
+                  <td>{row['step']}</td>
+                  <td>{row['upgrade']}</td>
+                  <td>{row['part']}</td>
+                  <td>{row['key_speedup_or_reduction']}</td>
+                </tr>
+                """
+                for _, row in dsa_summary.iterrows()
+            )
+            dsa_section = f"""
+    <h2>DSA Upgrade Evaluation</h2>
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Upgrade</th><th>Part</th><th>Main result</th></tr>
+      </thead>
+      <tbody>{dsa_rows}</tbody>
+    </table>
+    <p class="note">Full report: dsa_evaluation/00_dsa_evaluation_report.md</p>
+"""
+        except Exception:
+            dsa_section = ""
+
+    html = f"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Dong Da Logistics Dashboard</title>
+  <style>
+    body {{ margin: 0; font-family: Arial, sans-serif; background: #f6f7f9; color: #111827; }}
+    header {{ padding: 18px 24px; background: #111827; color: white; }}
+    main {{ padding: 20px 24px; }}
+    .grid {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px; }}
+    .card {{ background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; }}
+    .metric {{ font-size: 24px; font-weight: 700; margin-top: 6px; }}
+    .note {{ color: #6b7280; font-size: 13px; }}
+    table {{ width: 100%; border-collapse: collapse; background: white; border: 1px solid #e5e7eb; }}
+    th, td {{ padding: 9px 10px; border-bottom: 1px solid #e5e7eb; text-align: left; font-size: 14px; }}
+    th {{ background: #f3f4f6; }}
+    iframe {{ width: 100%; height: 620px; border: 1px solid #d1d5db; border-radius: 8px; background: white; }}
+    h2 {{ margin-top: 26px; }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Dong Da Logistics Dashboard</h1>
+  </header>
+  <main>
+    <section class="grid">
+      <div class="card">Delivered<div class="metric">{summary['delivered_orders']}</div></div>
+      <div class="card">Unassigned<div class="metric">{summary['unassigned_orders']}</div></div>
+      <div class="card">Shippers<div class="metric">{summary['active_shippers']}</div></div>
+      <div class="card">Total Time<div class="metric">{summary['total_time_min']} min</div></div>
+      <div class="card">Distance<div class="metric">{summary['total_distance_km']} km</div></div>
+    </section>
+
+    <h2>Interactive Map</h2>
+    <iframe src="part4_vrp_routes.html"></iframe>
+
+    {dsa_section}
+
+    <h2>Shipper Schedule</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>Shipper</th><th>Depot</th><th>Depart</th><th>Stops</th>
+          <th>Load kg</th><th>Time min</th><th>Distance km</th><th>Status</th>
+        </tr>
+      </thead>
+      <tbody>{rows}</tbody>
+    </table>
+
+    <h2>Simulation Events</h2>
+    <table>
+      <thead><tr><th>Time</th><th>Event</th><th>Shipper</th><th>Target</th></tr></thead>
+      <tbody>{event_rows}</tbody>
+    </table>
+  </main>
+</body>
+</html>
+"""
+    (OUTPUT_DIR / "dashboard.html").write_text(html, encoding="utf-8")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main() -> None:
+    ensure_output_dir()
+
+    print("=" * 70)
+    print("CITY LOGISTICS & ROUTING SYSTEM — COMPLETE PIPELINE")
+    print("Dong Da District, Hanoi, Vietnam")
+    print("=" * 70)
+
+    print("\n" + "=" * 70)
+    print("PART 1 — BUILD OPTIMIZED ROAD GRAPH + BASE MAP")
+    print("=" * 70)
+    G = build_routing_graph()
+    G = add_logistics_weights(G)
+    save_feature_layers()
+    export_outputs(G)
+    save_static_map(G)
+    save_interactive_map(G)
+    print_summary(G)
+
+    print(f"\nGraph ready: {G.number_of_nodes():,} nodes | {G.number_of_edges():,} edges")
+    delivery_data = part2_shortest_routes(G)
+    zone_summary = part3_zone_division(G)
+    solution = part4_vrp_optimization(G)
+    run_dsa_upgrade_evaluation(G, delivery_data, solution)
+    part5_simulation_dashboard()
+    create_presentation_visuals(G, delivery_data, zone_summary, solution)
+
+    print("\n" + "=" * 70)
+    print("COMPLETE PIPELINE FINISHED")
+    print("=" * 70)
+    print(f"Outputs saved in: {OUTPUT_DIR.resolve()}")
+    print("Open dashboard: dong_da_output/dashboard.html")
+
+
+if __name__ == "__main__":
+    main()
