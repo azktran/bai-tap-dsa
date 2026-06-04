@@ -19,6 +19,7 @@ Key improvements vs the original Part 1:
 from __future__ import annotations
 
 import os
+import sys
 import time
 import warnings
 import random
@@ -5688,12 +5689,97 @@ def run_stress_matrix_testing(G: nx.MultiDiGraph) -> dict[str, Any]:
         "massive_orders": massive_matrix.to_dict(orient="records"),
         "extreme_demand": demand_matrix.to_dict(orient="records"),
     }
+
+# =============================================================================
+# TERMINAL LOGGING + OUTPUT INDEX
+# =============================================================================
+
+class TeeStream:
+    """Write terminal output to both the console and a log file."""
+
+    def __init__(self, console_stream: Any, log_file: Any) -> None:
+        self.console_stream = console_stream
+        self.log_file = log_file
+
+    def write(self, text: str) -> int:
+        self.console_stream.write(text)
+        self.log_file.write(text)
+        self.log_file.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        self.console_stream.flush()
+        self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return False
+
+
+def setup_terminal_logging() -> Path:
+    log_dir = OUTPUT_DIR / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    log_path = log_dir / f"terminal_log_{timestamp}.txt"
+    latest_path = log_dir / "terminal_log_latest.txt"
+
+    log_file = open(log_path, "w", encoding="utf-8", buffering=1)
+    sys.stdout = TeeStream(sys.__stdout__, log_file)
+    sys.stderr = TeeStream(sys.__stderr__, log_file)
+
+    print(f"Terminal log file: {log_path.resolve()}")
+    print(f"Latest log alias : {latest_path.resolve()}")
+
+    # Keep a stable latest file path easy to find after the run.
+    try:
+        latest_path.write_text(f"Latest full log: {log_path.resolve()}\n", encoding="utf-8")
+    except PermissionError:
+        pass
+
+    return log_path
+
+
+def write_output_index(log_path: Path | None = None) -> None:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    index_path = OUTPUT_DIR / "OUTPUT_INDEX.txt"
+    lines = [
+        "DONG DA LOGISTICS OUTPUT INDEX",
+        "=" * 70,
+        "",
+        "Start here:",
+        f"1. Full terminal log: {log_path.resolve() if log_path else (OUTPUT_DIR / 'logs').resolve()}",
+        f"2. Main dashboard: {(OUTPUT_DIR / 'dashboard.html').resolve()}",
+        f"3. Unit test visuals: {(OUTPUT_DIR / 'unit_tests').resolve()}",
+        f"4. Integration test visuals: {(OUTPUT_DIR / 'integration_tests').resolve()}",
+        f"5. System testing matrix: {(OUTPUT_DIR / 'system_tests' / 'system_test_result_matrix.png').resolve()}",
+        f"6. Stress test 01 matrix: {(OUTPUT_DIR / 'stress_tests' / 'massive_orders' / 'stress01_massive_orders_matrix.png').resolve()}",
+        f"7. Stress test 02 matrix: {(OUTPUT_DIR / 'stress_tests' / 'extreme_demand' / 'stress02_extreme_demand_matrix.png').resolve()}",
+        "",
+        "Most useful report files:",
+        f"- Unit tests: {(OUTPUT_DIR / 'unit_tests').resolve()}",
+        f"- Integration tests: {(OUTPUT_DIR / 'integration_tests').resolve()}",
+        f"- System tests: {(OUTPUT_DIR / 'system_tests').resolve()}",
+        f"- Stress tests: {(OUTPUT_DIR / 'stress_tests').resolve()}",
+        f"- Presentation visuals: {(OUTPUT_DIR / 'presentation_visuals').resolve()}",
+        "",
+        "Raw data files:",
+        f"- delivery_nodes.json: {(OUTPUT_DIR / 'delivery_nodes.json').resolve()}",
+        f"- zone_assignments.json: {(OUTPUT_DIR / 'zone_assignments.json').resolve()}",
+        f"- vrp_solution.json: {(OUTPUT_DIR / 'vrp_solution.json').resolve()}",
+        f"- simulation_summary.json: {(OUTPUT_DIR / 'simulation_summary.json').resolve()}",
+        f"- simulation_events.json: {(OUTPUT_DIR / 'simulation_events.json').resolve()}",
+        "",
+        "Tip:",
+        "Open OUTPUT_INDEX.txt first, then open the PNG matrix files for the report.",
+    ]
+    index_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"Output index: {index_path.resolve()}")
 # =============================================================================
 # MAIN
 # =============================================================================
 
 def main() -> None:
     ensure_output_dir()
+    log_path = setup_terminal_logging()
 
     print("=" * 70)
     print("CITY LOGISTICS & ROUTING SYSTEM â€” COMPLETE PIPELINE")
@@ -5726,8 +5812,11 @@ def main() -> None:
     print("\n" + "=" * 70)
     print("COMPLETE PIPELINE FINISHED")
     print("=" * 70)
+    write_output_index(log_path)
     print(f"Outputs saved in: {OUTPUT_DIR.resolve()}")
     print("Open dashboard: dong_da_output/dashboard.html")
+    print(f"Open output index: {OUTPUT_DIR / 'OUTPUT_INDEX.txt'}")
+    print(f"Full terminal log: {log_path}")
 
 
 if __name__ == "__main__":
